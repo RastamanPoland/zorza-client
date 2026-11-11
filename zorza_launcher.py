@@ -10,7 +10,9 @@ Wymaga tylko Pythona 3.9+ (biblioteka standardowa). Obsluguje wersje gry
 1.19 i nowsze (w tym 26.x). Pliki gry sa pobierane z serwerow Mojangu,
 Fabric z meta.fabricmc.net. Logowanie wylacznie kontem Microsoft.
 """
+import base64
 import hashlib
+import html
 import json
 import math
 import os
@@ -27,11 +29,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 NAME = "Zorza Client"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 UA = f"RastamanPoland/zorza-client/{VERSION} (github.com/RastamanPoland/zorza-client)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -243,7 +246,11 @@ def resolve_version(cfg, log=print) -> dict:
         if not loaders:
             raise LauncherError(f"Fabric nie wspiera jeszcze wersji {vid}. "
                                 "Ustaw starsza 'game_version' albo 'use_fabric': false")
-        pick = next((l for l in loaders if l["loader"].get("stable")), loaders[0])
+        wanted = cfg.get("fabric_loader")
+        pick = next((l for l in loaders if wanted and l["loader"]["version"] == wanted), None)
+        if wanted and not pick:
+            log(f"Fabric Loader {wanted} nie pasuje do wersji {vid}, używam najnowszego stabilnego")
+        pick = pick or next((l for l in loaders if l["loader"].get("stable")), loaders[0])
         lv = pick["loader"]["version"]
         log(f"Fabric Loader {lv}")
         prof = get_json(f"{FABRIC_META}/versions/loader/{urllib.parse.quote(vid)}/{lv}/profile/json")
@@ -568,11 +575,31 @@ def valid_game_version(text: str) -> bool:
     return text == "latest" or re.fullmatch(r"\d+(\.\d+){1,2}", text) is not None
 
 
-def safe_jar_name(name: str) -> str:
+def safe_file_name(name: str, exts) -> str:
     name = Path(str(name).replace("\\", "/")).name
-    if not name.lower().endswith(".jar") or name.startswith("."):
-        raise LauncherError(f"Nieoczekiwana nazwa pliku moda: {name}")
+    if name.startswith(".") or not name.lower().endswith(tuple(exts)):
+        raise LauncherError(f"Nieoczekiwana nazwa pliku: {name}")
     return name
+
+
+def safe_jar_name(name: str) -> str:
+    return safe_file_name(name, (".jar",))
+
+
+def _load_index(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_index(path: Path, index: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(index, indent=2, ensure_ascii=False), "utf-8")
+
+
+def resourcepack_index(game_dir: Path) -> Path:
+    return game_dir / "zorza_resourcepacks.json"
 
 
 def mods_index_file(game_dir: Path) -> Path:
@@ -580,15 +607,11 @@ def mods_index_file(game_dir: Path) -> Path:
 
 
 def load_mods_index(game_dir: Path) -> dict:
-    try:
-        return json.loads(mods_index_file(game_dir).read_text("utf-8"))
-    except (OSError, ValueError):
-        return {}
+    return _load_index(mods_index_file(game_dir))
 
 
 def save_mods_index(game_dir: Path, index: dict) -> None:
-    game_dir.mkdir(parents=True, exist_ok=True)
-    mods_index_file(game_dir).write_text(json.dumps(index, indent=2, ensure_ascii=False), "utf-8")
+    _save_index(mods_index_file(game_dir), index)
 
 
 def mod_base(name: str) -> str:
@@ -650,38 +673,40 @@ def copy_profile_files(src: Path, dst: Path) -> None:
         (dst / "mods").mkdir(parents=True)
 
 
-def _store_mod(game_dir, url, filename, sha1, size, source, project_id, title, version):
-    """Pobiera plik moda, podmienia starsza wersje tego samego moda i zapisuje wpis."""
+def _store_file(target_dir, index_path, url, filename, exts, sha1, size, source, project_id, title, version):
+    """Pobiera plik, podmienia starsza wersje tego samego projektu i zapisuje wpis w indeksie."""
     if not str(url).startswith("https://"):
         raise LauncherError("Odrzucono adres pobierania, który nie używa HTTPS")
-    name = safe_jar_name(filename)
-    index = load_mods_index(game_dir)
+    name = safe_file_name(filename, exts)
+    index = _load_index(index_path)
     for old, info in list(index.items()):
         if info.get("source") == source and str(info.get("id")) == str(project_id) and old != name:
-            for old_path in (game_dir / "mods" / old, game_dir / "mods" / (old + ".disabled")):
+            for old_path in (target_dir / old, target_dir / (old + ".disabled")):
                 if old_path.exists():
                     old_path.unlink()
             del index[old]
-    disabled = game_dir / "mods" / (name + ".disabled")
+    disabled = target_dir / (name + ".disabled")
     if disabled.exists():
         disabled.unlink()  # nowa wersja jest wlaczona, bez duplikatu
-    download(url, game_dir / "mods" / name, sha1, size)
+    download(url, target_dir / name, sha1, size)
     index[name] = {"source": source, "id": str(project_id), "title": title, "version": version}
-    save_mods_index(game_dir, index)
+    _save_index(index_path, index)
+
+
+def _store_mod(game_dir, url, filename, sha1, size, source, project_id, title, version):
+    _store_file(game_dir / "mods", mods_index_file(game_dir), url, filename, (".jar",), sha1, size,
+                source, project_id, title, version)
 
 
 def modrinth_search(query: str, game_version: str, limit: int = 30, offset: int = 0, sort: str = None) -> list:
     """Bez zapytania zwraca najpopularniejsze mody (sortowanie po liczbie pobran)."""
-    facets = [["project_type:mod"], ["categories:fabric"], [f"versions:{game_version}"]]
+    facets = [["project_type:mod"], ["categories:fabric"]] + ([[f"versions:{game_version}"]] if game_version else [])
     params = {"limit": limit, "offset": offset, "facets": json.dumps(facets),
               "index": sort or ("relevance" if query else "downloads")}
     if query:
         params["query"] = query
     hits = get_json(f"{MODRINTH}/search?{urllib.parse.urlencode(params)}").get("hits", [])
-    return [{"source": "modrinth", "id": h["project_id"], "title": h.get("title", h["project_id"]),
-             "description": h.get("description", ""), "downloads": int(h.get("downloads", 0)),
-             "author": h.get("author", ""),
-             "url": f"https://modrinth.com/mod/{h.get('slug') or h['project_id']}"} for h in hits]
+    return [_modrinth_hit(h, "mod") for h in hits]
 
 
 def modrinth_install(project_id, game_version, game_dir, log=print, title=None, _seen=None) -> None:
@@ -736,10 +761,7 @@ def curseforge_search(query: str, game_version: str, api_key: str, limit: int = 
     else:
         params.update({"sortField": 2, "sortOrder": "desc"})  # popularnosc
     data = curseforge_get(f"/mods/search?{urllib.parse.urlencode(params)}", api_key).get("data", [])
-    return [{"source": "curseforge", "id": str(m["id"]), "title": m.get("name", str(m["id"])),
-             "description": m.get("summary", ""), "downloads": int(m.get("downloadCount", 0)),
-             "author": ((m.get("authors") or [{}])[0] or {}).get("name", ""),
-             "url": (m.get("links") or {}).get("websiteUrl", "")} for m in data]
+    return [_curseforge_hit(m) for m in data]
 
 
 def curseforge_install(mod_id, game_version, game_dir, api_key, log=print, title=None, _seen=None) -> None:
@@ -772,6 +794,356 @@ def install_mod(hit: dict, game_version: str, game_dir: Path, curseforge_key: st
         curseforge_install(hit["id"], game_version, game_dir, curseforge_key, log, hit.get("title"))
     else:
         modrinth_install(hit["id"], game_version, game_dir, log, hit.get("title"))
+
+
+# ------------------------------------------------- typy tresci, szczegoly, modpacki
+
+CONTENT_TYPES = {
+    "mod": {"label": "Mody", "mr": [["project_type:mod"], ["categories:fabric"]], "mr_loaders": ["fabric"],
+            "cf_slug": "mc-mods", "cf_class": 6, "cf_loader": 4},
+    "modpack": {"label": "Modpacki", "mr": [["project_type:modpack"], ["categories:fabric"]],
+                "mr_loaders": ["fabric"], "cf_slug": "modpacks", "cf_class": 4471, "cf_loader": 4},
+    "resourcepack": {"label": "Paczki zasobów", "mr": [["project_type:resourcepack"]], "mr_loaders": ["minecraft"],
+                     "cf_slug": "texture-packs", "cf_class": 12, "cf_loader": None},
+    "datapack": {"label": "Paczki danych", "mr": [["categories:datapack"]], "mr_loaders": ["datapack"],
+                 "cf_slug": "data-packs", "cf_class": None, "cf_loader": None},  # id klasy pobierane z API
+}
+_cf_classes = {}
+
+
+def curseforge_post(path: str, payload: dict, api_key: str):
+    if not api_key:
+        raise LauncherError("Brak klucza API CurseForge. Wpisz go w Ustawieniach.")
+    try:
+        return get_json(CURSEFORGE + path, data=payload, headers={"x-api-key": api_key})
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise LauncherError("CurseForge odrzucił klucz API (sprawdź go w Ustawieniach)")
+        raise
+
+
+def curseforge_class_id(kind: str, api_key: str) -> int:
+    t = CONTENT_TYPES[kind]
+    if t["cf_class"]:
+        return t["cf_class"]
+    if t["cf_slug"] not in _cf_classes:
+        for c in curseforge_get("/categories?gameId=432&classesOnly=true", api_key).get("data", []):
+            if c.get("slug"):
+                _cf_classes[c["slug"]] = c["id"]
+    if t["cf_slug"] not in _cf_classes:
+        raise LauncherError(f"CurseForge nie ma kategorii „{t['label']}” dla Minecrafta")
+    return _cf_classes[t["cf_slug"]]
+
+
+def search_content(kind, source, query, game_version, api_key="", limit=30, offset=0, sort=None) -> list:
+    """Wyszukiwanie dowolnego typu tresci. Modpacki nie sa filtrowane po wersji gry."""
+    version = None if kind == "modpack" else game_version
+    if source == "modrinth":
+        if kind == "mod":
+            return modrinth_search(query, version, limit, offset, sort)
+        facets = [list(f) for f in CONTENT_TYPES[kind]["mr"]] + ([[f"versions:{version}"]] if version else [])
+        params = {"limit": limit, "offset": offset, "facets": json.dumps(facets),
+                  "index": sort or ("relevance" if query else "downloads")}
+        if query:
+            params["query"] = query
+        hits = get_json(f"{MODRINTH}/search?{urllib.parse.urlencode(params)}").get("hits", [])
+        return [_modrinth_hit(h, kind) for h in hits]
+    t = CONTENT_TYPES[kind]
+    params = {"gameId": 432, "classId": curseforge_class_id(kind, api_key), "pageSize": limit, "index": offset}
+    if t["cf_loader"]:
+        params["modLoaderType"] = t["cf_loader"]
+    if version:
+        params["gameVersion"] = version
+    if query:
+        params["searchFilter"] = query
+    else:
+        params.update({"sortField": 2, "sortOrder": "desc"})  # popularnosc
+    data = curseforge_get(f"/mods/search?{urllib.parse.urlencode(params)}", api_key).get("data", [])
+    return [_curseforge_hit(m) for m in data]
+
+
+def _modrinth_hit(h: dict, kind: str = "mod") -> dict:
+    slug = h.get("slug") or h["project_id"]
+    page = {"modpack": "modpack", "resourcepack": "resourcepack", "datapack": "datapack"}.get(kind, "mod")
+    return {"source": "modrinth", "id": h["project_id"], "title": h.get("title", h["project_id"]),
+            "description": h.get("description", ""), "downloads": int(h.get("downloads", 0)),
+            "author": h.get("author", ""), "url": f"https://modrinth.com/{page}/{slug}",
+            "icon": h.get("icon_url") or ""}
+
+
+def _curseforge_hit(m: dict) -> dict:
+    return {"source": "curseforge", "id": str(m["id"]), "title": m.get("name", str(m["id"])),
+            "description": m.get("summary", ""), "downloads": int(m.get("downloadCount", 0)),
+            "author": ((m.get("authors") or [{}])[0] or {}).get("name", ""),
+            "url": (m.get("links") or {}).get("websiteUrl", ""),
+            "icon": (m.get("logo") or {}).get("thumbnailUrl", "")}
+
+
+def plain_text(text: str) -> str:
+    """Zamienia opis w Markdownie (Modrinth) albo HTML (CurseForge) na zwykly tekst."""
+    text = str(text or "")
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", "", text)
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</h\d>|</li>|</tr>", "\n", text)
+    text = re.sub(r"(?i)<li[^>]*>", "• ", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", text)        # obrazki
+    text = re.sub(r"\[\]\([^)]*\)", "", text)                # puste linki po obrazkach
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)    # linki -> sam tekst
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)        # naglowki
+    text = re.sub(r"(?m)^\s*[-*+]\s+", "• ", text)           # listy
+    text = re.sub(r"(\*\*|__|`|~~)", "", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def project_details(hit: dict, api_key: str = "") -> dict:
+    """Pelny opis, linki, kategorie i data aktualizacji projektu."""
+    if hit["source"] == "modrinth":
+        p = get_json(f"{MODRINTH}/project/{urllib.parse.quote(str(hit['id']), safe='')}")
+        lic = p.get("license") or {}
+        links = [("Strona projektu", hit.get("url")), ("Kod źródłowy", p.get("source_url")),
+                 ("Zgłoś błąd", p.get("issues_url")), ("Wiki", p.get("wiki_url")), ("Discord", p.get("discord_url"))]
+        return {"description": plain_text(p.get("body") or p.get("description", "")),
+                "categories": [c for c in p.get("categories", []) if c not in ("fabric", "datapack", "minecraft")],
+                "updated": str(p.get("updated") or "")[:10], "license": lic.get("name") or lic.get("id") or "",
+                "followers": p.get("followers"),
+                "links": [(label, url) for label, url in links if str(url or "").startswith("https://")]}
+    mod_id = int(hit["id"])
+    data = curseforge_get(f"/mods/{mod_id}", api_key).get("data", {})
+    try:
+        description = curseforge_get(f"/mods/{mod_id}/description", api_key).get("data", "")
+    except (urllib.error.HTTPError, LauncherError):
+        description = data.get("summary", "")
+    links = data.get("links") or {}
+    pairs = [("Strona projektu", links.get("websiteUrl") or hit.get("url")), ("Kod źródłowy", links.get("sourceUrl")),
+             ("Zgłoś błąd", links.get("issuesUrl")), ("Wiki", links.get("wikiUrl"))]
+    return {"description": plain_text(description or data.get("summary", "")),
+            "categories": [c.get("name", "") for c in data.get("categories", []) if c.get("name")],
+            "updated": str(data.get("dateModified") or "")[:10], "license": "", "followers": None,
+            "links": [(label, url) for label, url in pairs if str(url or "").startswith("https://")]}
+
+
+def fetch_icon(url: str) -> bytes:
+    """Ikona projektu, tylko PNG lub GIF (tyle obsluguje Tk bez dodatkowych bibliotek)."""
+    if not str(url).startswith("https://"):
+        return b""
+    data = http(url, headers={"Accept": "image/png,image/gif,*/*"}, timeout=15)
+    if len(data) > 600_000 or not (data.startswith(b"\x89PNG") or data.startswith(b"GIF8")):
+        return b""
+    return data
+
+
+def safe_join(base: Path, rel: str) -> Path:
+    """Sciezka z paczki, ktora nie moze wyjsc poza folder profilu."""
+    rel = str(rel).replace("\\", "/")
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    if (not parts or rel.startswith("/") or re.match(r"^[A-Za-z]:", rel)
+            or any(p == ".." or ":" in p for p in parts)):
+        raise LauncherError(f"Niebezpieczna ścieżka w paczce: {rel}")
+    target = base.joinpath(*parts)
+    base_resolved = base.resolve()
+    if base_resolved != target.resolve() and base_resolved not in target.resolve().parents:
+        raise LauncherError(f"Niebezpieczna ścieżka w paczce: {rel}")
+    return target
+
+
+def _extract_overrides(zf: zipfile.ZipFile, prefix: str, game_dir: Path) -> int:
+    prefix = prefix.strip("/") + "/"
+    count = 0
+    for info in zf.infolist():
+        if info.is_dir() or not info.filename.startswith(prefix) or info.filename == prefix:
+            continue
+        target = safe_join(game_dir, info.filename[len(prefix):])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        count += 1
+    return count
+
+
+def _install_mrpack(zf, game_dir, progress=None) -> dict:
+    index = json.loads(zf.read("modrinth.index.json").decode("utf-8"))
+    if index.get("game", "minecraft") != "minecraft":
+        raise LauncherError("To nie jest modpack do Minecrafta")
+    deps = index.get("dependencies") or {}
+    if not deps.get("minecraft"):
+        raise LauncherError("Modpack nie podaje wersji Minecrafta")
+    for other, label in (("forge", "Forge"), ("neoforge", "NeoForge"), ("quilt-loader", "Quilt")):
+        if other in deps:
+            raise LauncherError(f"Ten modpack wymaga {label}, a Zorza obsługuje tylko Fabric")
+    tasks = []
+    for f in index.get("files", []):
+        if (f.get("env") or {}).get("client") == "unsupported":
+            continue  # plik tylko dla serwera
+        urls = [u for u in f.get("downloads", []) if str(u).startswith("https://")]
+        if not urls:
+            raise LauncherError(f"Brak bezpiecznego adresu pobierania dla {f.get('path')}")
+        tasks.append((urls[0], safe_join(game_dir, f["path"]), (f.get("hashes") or {}).get("sha1"), f.get("fileSize")))
+    download_all(tasks, progress)
+    _extract_overrides(zf, "overrides", game_dir)
+    _extract_overrides(zf, "client-overrides", game_dir)
+    return {"name": index.get("name") or "Modpack", "game_version": deps["minecraft"],
+            "fabric_loader": deps.get("fabric-loader", ""), "version": index.get("versionId", ""),
+            "files": len(tasks), "blocked": []}
+
+
+def _install_cf_manifest(zf, game_dir, api_key, progress=None) -> dict:
+    m = json.loads(zf.read("manifest.json").decode("utf-8"))
+    mc = (m.get("minecraft") or {}).get("version")
+    loaders = [str(x.get("id", "")) for x in (m.get("minecraft") or {}).get("modLoaders", [])]
+    fabric = next((x.split("-", 1)[1] for x in loaders if x.startswith("fabric-")), "")
+    if not mc:
+        raise LauncherError("Modpack nie podaje wersji Minecrafta")
+    if loaders and not fabric:
+        raise LauncherError(f"Ten modpack wymaga {loaders[0]}, a Zorza obsługuje tylko Fabric")
+    file_ids = [int(f["fileID"]) for f in m.get("files", []) if f.get("required", True)]
+    files = curseforge_post("/mods/files", {"fileIds": file_ids}, api_key).get("data", []) if file_ids else []
+    mod_ids = sorted({f["modId"] for f in files})
+    mods = {d["id"]: d for d in curseforge_post("/mods", {"modIds": mod_ids}, api_key).get("data", [])} if mod_ids else {}
+    folders = {12: "resourcepacks", 6552: "shaderpacks"}
+    tasks, blocked = [], []
+    for f in files:
+        mod = mods.get(f["modId"], {})
+        folder = folders.get(mod.get("classId"), "mods" if str(f.get("fileName", "")).endswith(".jar") else "resourcepacks")
+        name = safe_file_name(f.get("fileName", ""), (".jar", ".zip"))
+        if not str(f.get("downloadUrl") or "").startswith("https://"):
+            blocked.append({"name": mod.get("name") or name, "file": name, "folder": folder,
+                            "url": (mod.get("links") or {}).get("websiteUrl", "")})
+            continue
+        sha1 = next((h.get("value") for h in f.get("hashes", []) if h.get("algo") == 1), None)
+        tasks.append((f["downloadUrl"], game_dir / folder / name, sha1, f.get("fileLength")))
+    download_all(tasks, progress)
+    _extract_overrides(zf, m.get("overrides") or "overrides", game_dir)
+    return {"name": m.get("name") or "Modpack", "game_version": mc, "fabric_loader": fabric,
+            "version": m.get("version", ""), "files": len(tasks), "blocked": blocked,
+            "missing": max(0, len(file_ids) - len(files))}
+
+
+def install_modpack_file(path: Path, game_dir: Path, api_key: str = "", progress=None) -> dict:
+    """Instaluje modpack z pliku .mrpack (Modrinth) albo .zip (CurseForge) do nowego folderu profilu."""
+    try:
+        zf = zipfile.ZipFile(path)
+    except zipfile.BadZipFile:
+        raise LauncherError("To nie jest prawidłowy plik modpacka")
+    with zf:
+        names = set(zf.namelist())
+        game_dir.mkdir(parents=True, exist_ok=True)
+        if "modrinth.index.json" in names:
+            return _install_mrpack(zf, game_dir, progress)
+        if "manifest.json" in names:
+            return _install_cf_manifest(zf, game_dir, api_key, progress)
+    raise LauncherError("Plik nie zawiera ani modrinth.index.json, ani manifest.json")
+
+
+def modrinth_pick(project_id, loaders, game_version=None):
+    params = {"loaders": json.dumps(loaders)}
+    if game_version:
+        params["game_versions"] = json.dumps([game_version])
+    pid = urllib.parse.quote(str(project_id), safe="")
+    versions = get_json(f"{MODRINTH}/project/{pid}/version?{urllib.parse.urlencode(params)}")
+    return versions[0] if versions else None
+
+
+def curseforge_pick_file(mod_id, game_version, loader_type, api_key):
+    params = {"pageSize": 50}
+    if game_version:
+        params["gameVersion"] = game_version
+    if loader_type:
+        params["modLoaderType"] = loader_type
+    files = curseforge_get(f"/mods/{int(mod_id)}/files?{urllib.parse.urlencode(params)}", api_key).get("data", [])
+    return sorted(files, key=lambda x: x.get("fileDate", ""), reverse=True)[0] if files else None
+
+
+def _primary_file(version: dict, title: str) -> dict:
+    files = version.get("files") or []
+    if not files:
+        raise LauncherError(f"„{title}” nie ma pliku do pobrania")
+    return next((x for x in files if x.get("primary")), files[0])
+
+
+def install_modpack(hit: dict, game_dir: Path, api_key: str = "", progress=None) -> dict:
+    title = hit.get("title", str(hit["id"]))
+    cache = ROOT / "cache"
+    if hit["source"] == "modrinth":
+        ver = modrinth_pick(hit["id"], ["fabric"])
+        if not ver:
+            raise LauncherError(f"„{title}” nie ma wersji z Fabric")
+        f = _primary_file(ver, title)
+        url, name, sha1, size = f["url"], safe_file_name(f["filename"], (".mrpack",)), f.get("hashes", {}).get("sha1"), f.get("size")
+    else:
+        f = curseforge_pick_file(hit["id"], None, 4, api_key)
+        if not f:
+            raise LauncherError(f"„{title}” nie ma wersji z Fabric")
+        if not f.get("downloadUrl"):
+            raise LauncherError(f"Autor „{title}” nie pozwala pobierać modpacka przez zewnętrzne launchery.")
+        url, name, size = f["downloadUrl"], safe_file_name(f["fileName"], (".zip",)), f.get("fileLength")
+        sha1 = next((h.get("value") for h in f.get("hashes", []) if h.get("algo") == 1), None)
+    if not str(url).startswith("https://"):
+        raise LauncherError("Odrzucono adres pobierania, który nie używa HTTPS")
+    download(url, cache / name, sha1, size)
+    return install_modpack_file(cache / name, game_dir, api_key, progress)
+
+
+def install_pack(hit: dict, kind: str, game_version: str, target_dir: Path, index_path: Path,
+                 api_key: str = "", log=print) -> None:
+    """Paczka zasobow albo paczka danych: jeden plik .zip, bez zaleznosci."""
+    title = hit.get("title", str(hit["id"]))
+    if hit["source"] == "modrinth":
+        ver = modrinth_pick(hit["id"], CONTENT_TYPES[kind]["mr_loaders"], game_version)
+        if not ver:
+            raise LauncherError(f"„{title}” nie ma wersji dla Minecraft {game_version}")
+        f = _primary_file(ver, title)
+        _store_file(target_dir, index_path, f["url"], f["filename"], (".zip",), f.get("hashes", {}).get("sha1"),
+                    f.get("size"), "modrinth", hit["id"], title, ver.get("version_number", ""))
+    else:
+        f = curseforge_pick_file(hit["id"], game_version, None, api_key)
+        if not f:
+            raise LauncherError(f"„{title}” nie ma wersji dla Minecraft {game_version}")
+        if not f.get("downloadUrl"):
+            raise LauncherError(f"Autor „{title}” nie pozwala pobierać przez zewnętrzne launchery. "
+                                "Pobierz plik ze strony CurseForge.")
+        sha1 = next((h.get("value") for h in f.get("hashes", []) if h.get("algo") == 1), None)
+        _store_file(target_dir, index_path, f["downloadUrl"], f["fileName"], (".zip",), sha1, f.get("fileLength"),
+                    "curseforge", hit["id"], title, f.get("displayName", ""))
+    log(title)
+
+
+def list_worlds(game_dir: Path) -> list:
+    saves = game_dir / "saves"
+    if not saves.is_dir():
+        return []
+    worlds = [p for p in saves.iterdir() if p.is_dir() and (p / "level.dat").exists()]
+    return sorted(worlds, key=lambda p: (p / "level.dat").stat().st_mtime, reverse=True)
+
+
+def list_packs(folder: Path, index_path: Path) -> list:
+    """Paczki zasobow lub danych: pliki .zip i rozpakowane foldery."""
+    index = _load_index(index_path)
+    if not folder.is_dir():
+        return []
+    out = []
+    for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+        if p.is_dir() or p.name.lower().endswith(".zip"):
+            info = index.get(p.name, {})
+            out.append({"file": p.name, "title": info.get("title", p.name), "source": info.get("source", "ręcznie"),
+                        "folder": p.is_dir()})
+    return out
+
+
+def remove_pack(folder: Path, index_path: Path, name: str) -> None:
+    name = str(name)
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise LauncherError(f"Nieprawidłowa nazwa: {name}")
+    path = folder / name
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+    index = _load_index(index_path)
+    if index.pop(name, None) is not None:
+        _save_index(index_path, index)
 
 
 def open_folder(path: Path) -> None:
@@ -811,7 +1183,7 @@ def launch_settings(cfg: dict, profile: dict) -> dict:
     """Ustawienia globalne nadpisane ustawieniami profilu."""
     return dict(cfg, game_version=profile["game_version"], use_fabric=bool(profile.get("use_fabric", True)),
                 memory_mb=int(profile.get("memory_mb") or cfg.get("memory_mb", 4096)),
-                jvm_args=profile.get("jvm_args", ""))
+                jvm_args=profile.get("jvm_args", ""), fabric_loader=profile.get("fabric_loader", ""))
 
 
 # ---------------------------------------------------------------- interfejsy
@@ -885,7 +1257,7 @@ def round_points(x1, y1, x2, y2, r):
 
 def run_gui():
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import filedialog, messagebox, ttk
 
     BG, PANEL, PANEL2, TEXT, MUTED, LINE = "#0b0d1a", "#11142a", "#1a1f3d", "#e9ecff", "#8088a8", "#262b4d"
     GREEN, GREEN_HI, RED, SELECT = "#3ddc97", "#6ff0b6", "#ff7a90", "#2b3f78"
@@ -900,7 +1272,8 @@ def run_gui():
     pdata = load_profiles(cfg)
     events = queue.Queue()
     state = {"account": None, "login": None, "preparing": None, "running": None, "play_after": None,
-             "versions": ["latest"], "log": [], "console": None, "editors": {}, "downloaders": {}}
+             "versions": ["latest"], "log": [], "console": None, "editors": {}, "downloaders": {},
+             "modpack_busy": False}
 
     root = tk.Tk()
     root.title(f"{NAME} {VERSION}")
@@ -1040,6 +1413,8 @@ def run_gui():
     toolbar = tk.Frame(root, bg=PANEL)
     toolbar.pack(fill="x")
     make_button(toolbar, "＋  Dodaj profil", lambda: add_profile_dialog()).pack(side="left", padx=(10, 4), pady=6)
+    make_button(toolbar, "Modpacki…", lambda: open_downloader(kind="modpack")).pack(side="left", padx=4)
+    make_button(toolbar, "Importuj modpack…", lambda: import_modpack()).pack(side="left", padx=4)
     folders_btn = make_button(toolbar, "Foldery  ▾", lambda: popup(folders_menu(), folders_btn))
     folders_btn.pack(side="left", padx=4)
     make_button(toolbar, "Ustawienia", lambda: settings_dialog()).pack(side="left", padx=4)
@@ -1119,7 +1494,7 @@ def run_gui():
     stop_btn = make_button(side, "■  Zatrzymaj", lambda: stop_game(), "danger")
     stop_btn.pack(fill="x", padx=18, pady=(0, 14))
     for text, command in (("Edytuj profil…", lambda: edit_profile()),
-                          ("Pobierz mody…", lambda: open_downloader()),
+                          ("Pobierz mody i paczki…", lambda: open_downloader()),
                           ("Folder profilu", lambda: open_folder(profile_dir(pdata["selected"]))),
                           ("Kopiuj profil", lambda: copy_profile())):
         make_button(side, text, command).pack(fill="x", padx=18, pady=3)
@@ -1167,7 +1542,7 @@ def run_gui():
         menu.add_command(label="▶  Graj", command=lambda: play(pid))
         menu.add_command(label="Edytuj profil…", command=lambda: edit_profile(pid))
         menu.add_command(label="Mody…", command=lambda: edit_profile(pid, "mods"))
-        menu.add_command(label="Pobierz mody…", command=lambda: open_downloader(pid))
+        menu.add_command(label="Pobierz mody i paczki…", command=lambda: open_downloader(pid))
         menu.add_command(label="Folder profilu", command=lambda: open_folder(profile_dir(pid)))
         menu.add_command(label="Kopiuj profil", command=copy_profile)
         menu.add_separator()
@@ -1446,6 +1821,8 @@ def run_gui():
         make_check(pv, "Fabric (wymagany do modów)", fabric).grid(row=3, column=1, sticky="w", pady=4)
         pv_msg = make_label(pv, "", 12, GREEN)
         pv_msg.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        make_label(pv, f"Fabric Loader: {p['fabric_loader']} (z modpacka)" if p.get("fabric_loader")
+                   else "Fabric Loader: najnowszy stabilny", 12, MUTED).grid(row=6, column=1, sticky="w", pady=(6, 0))
 
         def save_version():
             name, version = name_e.get().strip()[:40], ver_cb.get().strip() or "latest"
@@ -1459,7 +1836,7 @@ def run_gui():
             save_profiles(pdata)
             d.title(f"Profil – {name}")
             refresh_all()
-            refresh_mods()
+            refresh_lists()
             pv_msg.config(text="Zapisano.", fg=GREEN)
 
         make_button(pv, "Zapisz", save_version, "primary").grid(row=4, column=1, sticky="w", pady=(12, 0))
@@ -1525,7 +1902,6 @@ def run_gui():
         make_button(mods_bar, "Odśwież", lambda: mods_changed(pid)).pack(side="left", padx=(8, 0))
         mods_lb.bind("<Double-Button-1>", toggle)
         pages["mods"] = pm
-        editor["refresh_mods"] = refresh_mods
 
         # --- Ustawienia
         ps = tk.Frame(content, bg=BG)
@@ -1564,17 +1940,107 @@ def run_gui():
         make_button(ps, "Zapisz", save_settings, "primary").grid(row=4, column=1, sticky="w", pady=(12, 0))
         pages["settings"] = ps
 
+        # --- Paczki zasobów
+        pr = tk.Frame(content, bg=BG)
+        make_label(pr, "Paczki zasobów", 18, bold=True).pack(fill="x", pady=(0, 10))
+        rp_bar = tk.Frame(pr, bg=BG)
+        rp_bar.pack(fill="x")
+        rp_lb = make_listbox(pr, 14)
+        rp_lb.pack(fill="both", expand=True, pady=(10, 6))
+        rp_msg = make_label(pr, "", 12, MUTED, wraplength=560)
+        rp_msg.pack(fill="x")
+        rp_rows = []
+
+        def refresh_packs():
+            game_dir = profile_dir(pid)
+            rp_rows[:] = list_packs(game_dir / "resourcepacks", resourcepack_index(game_dir))
+            rp_lb.delete(0, "end")
+            for m in rp_rows:
+                label = m["title"] if m["title"] == m["file"] else f"{m['title']}   ·   {m['file']}"
+                rp_lb.insert("end", label + ("   (folder)" if m["folder"] else ""))
+            rp_msg.config(text="Włączysz je w grze: Opcje → Paczki zasobów." if rp_rows
+                          else "Brak paczek zasobów. Kliknij „Pobierz paczki zasobów…”.", fg=MUTED)
+
+        def remove_rp():
+            sel = rp_lb.curselection()
+            m = rp_rows[sel[0]] if sel and sel[0] < len(rp_rows) else None
+            if not m:
+                return rp_msg.config(text="Zaznacz paczkę na liście.", fg=RED)
+            if not messagebox.askyesno(NAME, f"Usunąć {m['file']} z profilu?", parent=d):
+                return
+            game_dir = profile_dir(pid)
+            try:
+                remove_pack(game_dir / "resourcepacks", resourcepack_index(game_dir), m["file"])
+            except (OSError, LauncherError) as e:
+                return rp_msg.config(text=f"Nie udało się usunąć: {e}", fg=RED)
+            mods_changed(pid)
+            rp_msg.config(text=f"Usunięto: {m['title']}", fg=GREEN)
+
+        make_button(rp_bar, "Pobierz paczki zasobów…", lambda: open_downloader(pid, "resourcepack"),
+                    "primary").pack(side="left")
+        make_button(rp_bar, "Usuń", remove_rp, "danger").pack(side="left", padx=(8, 0))
+        make_button(rp_bar, "Folder", lambda: open_folder(profile_dir(pid) / "resourcepacks")).pack(side="left", padx=(8, 0))
+        make_button(rp_bar, "Odśwież", lambda: mods_changed(pid)).pack(side="left", padx=(8, 0))
+        pages["resourcepacks"] = pr
+
+        # --- Światy i paczki danych
+        pw = tk.Frame(content, bg=BG)
+        make_label(pw, "Światy i paczki danych", 18, bold=True).pack(fill="x", pady=(0, 10))
+        w_bar = tk.Frame(pw, bg=BG)
+        w_bar.pack(fill="x")
+        w_lb = make_listbox(pw, 14)
+        w_lb.pack(fill="both", expand=True, pady=(10, 6))
+        w_msg = make_label(pw, "", 12, MUTED, wraplength=560)
+        w_msg.pack(fill="x")
+        w_rows = []
+
+        def refresh_worlds():
+            w_rows[:] = list_worlds(profile_dir(pid))
+            w_lb.delete(0, "end")
+            for world in w_rows:
+                count = len(list_packs(world / "datapacks", world / "zorza_datapacks.json"))
+                w_lb.insert("end", f"{world.name}   ·   paczki danych: {count}")
+            w_msg.config(text="Paczki danych instaluje się do konkretnego świata." if w_rows
+                         else "Brak światów. Uruchom grę i utwórz świat.", fg=MUTED)
+
+        def selected_world():
+            sel = w_lb.curselection()
+            if not sel or sel[0] >= len(w_rows):
+                w_msg.config(text="Zaznacz świat na liście.", fg=RED)
+                return None
+            return w_rows[sel[0]]
+
+        def open_world(sub=""):
+            world = selected_world()
+            if world:
+                open_folder(world / sub if sub else world)
+
+        make_button(w_bar, "Pobierz paczki danych…", lambda: open_downloader(pid, "datapack"),
+                    "primary").pack(side="left")
+        make_button(w_bar, "Folder datapacks", lambda: open_world("datapacks")).pack(side="left", padx=(8, 0))
+        make_button(w_bar, "Folder świata", lambda: open_world()).pack(side="left", padx=(8, 0))
+        make_button(w_bar, "Odśwież", lambda: refresh_worlds()).pack(side="left", padx=(8, 0))
+        pages["worlds"] = pw
+
+        def refresh_lists():
+            refresh_mods()
+            refresh_packs()
+            refresh_worlds()
+
+        editor["refresh_mods"] = refresh_lists
+
         def show(page_name):
             for frame in pages.values():
                 frame.pack_forget()
             pages[page_name].pack(fill="both", expand=True, padx=22, pady=18)
             for key, button in nav_buttons.items():
                 button.config(bg=SELECT if key == page_name else PANEL)
-            if page_name == "mods":
-                refresh_mods()
+            if page_name in ("mods", "resourcepacks", "worlds"):
+                refresh_lists()
 
         make_label(nav, shorten(p["name"], 18), 14, TEXT, bold=True, bg=PANEL).pack(fill="x", padx=16, pady=(18, 10))
-        for key, label in (("version", "Wersja"), ("mods", "Mody"), ("settings", "Ustawienia")):
+        for key, label in (("version", "Wersja"), ("mods", "Mody"), ("resourcepacks", "Paczki zasobów"),
+                           ("worlds", "Światy"), ("settings", "Ustawienia")):
             button = tk.Button(nav, text=label, anchor="w", relief="flat", bd=0, padx=16, pady=8, cursor="hand2",
                                font=font(13), bg=PANEL, fg=TEXT, activebackground=SELECT, activeforeground=TEXT,
                                highlightthickness=0, command=lambda k=key: show(k))
@@ -1589,26 +2055,123 @@ def run_gui():
         d.protocol("WM_DELETE_WINDOW", close)
         show(page)
 
-    # ============================================================ pobieranie modów
-    def open_downloader(pid=None):
+    # ============================================================ pobieranie treści
+    def pick_world(pid, parent, on_pick):
+        worlds = list_worlds(profile_dir(pid))
+        if not worlds:
+            messagebox.showinfo(NAME, "Ten profil nie ma jeszcze żadnego świata.\n\n"
+                                      "Uruchom grę, utwórz świat i spróbuj ponownie.", parent=parent)
+            return
+        d = make_dialog("Wybierz świat", 460, 400)
+        make_label(d, "Do którego świata dodać paczkę danych?", 15, bold=True).pack(fill="x", padx=20, pady=(18, 8))
+        row = tk.Frame(d, bg=BG)
+        row.pack(side="bottom", fill="x", padx=20, pady=14)
+        listbox = make_listbox(d, 10)
+        listbox.pack(fill="both", expand=True, padx=20)
+        for world in worlds:
+            listbox.insert("end", world.name)
+
+        def choose(_event=None):
+            sel = listbox.curselection()
+            world = worlds[sel[0] if sel and sel[0] < len(worlds) else 0]
+            d.destroy()
+            on_pick(world)
+
+        make_button(row, "Anuluj", d.destroy).pack(side="right")
+        make_button(row, "Dodaj do świata", choose, "primary").pack(side="right", padx=8)
+        listbox.bind("<Double-Button-1>", choose)
+
+    def start_modpack_install(job, fallback_name, pack_meta=None, finished=None):
+        """job(folder_profilu, postep) -> info. Po udanej instalacji tworzy nowy profil."""
+        if state["modpack_busy"]:
+            set_status("Inny modpack właśnie się instaluje.", True)
+            return False
+        pid = new_profile_id(fallback_name, pdata["profiles"])
+        game_dir = profile_dir(pid)
+        state["modpack_busy"] = True
+        set_progress(0)
+        set_status(f"Instaluję modpack „{fallback_name}”…")
+
+        def progress(done_count, total):
+            ui(lambda: set_progress(done_count / total if total else 0))
+
+        def done(info):
+            state["modpack_busy"] = False
+            set_progress(0)
+            name = shorten(info.get("name") or fallback_name, 40)
+            p = {"name": name, "game_version": info["game_version"], "use_fabric": True}
+            if info.get("fabric_loader"):
+                p["fabric_loader"] = info["fabric_loader"]
+            if pack_meta:
+                p["pack"] = dict(pack_meta, version=info.get("version", ""))
+            pdata["profiles"][pid] = p
+            pdata["selected"] = pid
+            save_profiles(pdata)
+            refresh_all()
+            msg = f"Zainstalowano modpack „{name}” jako nowy profil ({info.get('files', 0)} plików)"
+            set_status(msg)
+            notes = []
+            if info.get("missing"):
+                notes.append(f"{info['missing']} plików z tego modpacka nie ma już na CurseForge.")
+            if info.get("blocked"):
+                lines = "\n".join(f"• {b['name']} ({b['file']}) → folder {b['folder']}" for b in info["blocked"][:15])
+                notes.append("Autorzy tych plików nie pozwalają pobierać ich przez launchery. Pobierz je ze strony "
+                             "CurseForge i wrzuć do podanego folderu profilu (linki są w Konsoli):\n" + lines)
+                for b in info["blocked"]:
+                    write_log(f"Do pobrania ręcznie: {b['name']} ({b['file']}) {b.get('url') or ''}")
+            if notes:
+                messagebox.showwarning(NAME, msg + "\n\n" + "\n\n".join(notes), parent=root)
+            if finished:
+                finished(name)
+
+        def fail(msg):
+            state["modpack_busy"] = False
+            set_progress(0)
+            shutil.rmtree(game_dir, ignore_errors=True)  # folder utworzony wyłącznie przez tę instalację
+            set_status(msg, True)
+            if finished:
+                finished(None, msg)
+
+        background(lambda: job(game_dir, progress), done, fail)
+        return True
+
+    def import_modpack():
+        path = filedialog.askopenfilename(parent=root, title="Wybierz plik modpacka",
+                                          filetypes=[("Modpack", "*.mrpack *.zip"), ("Wszystkie pliki", "*.*")])
+        if not path:
+            return
+        key = curseforge_key(cfg)
+        start_modpack_install(lambda game_dir, prog: install_modpack_file(Path(path), game_dir, key, prog),
+                              Path(path).stem)
+
+    def open_downloader(pid=None, kind="mod"):
         pid = pid or pdata["selected"]
         dl = state["downloaders"].get(pid)
         if dl and alive(dl["win"]):
+            dl["set_kind"](kind)
             dl["win"].lift()
             return
-        d = make_dialog(f"Pobierz mody – {profile(pid)['name']}", 960, 600, resizable=True)
-        dl = {"win": d, "source": "modrinth", "results": [], "key": None, "req": 0, "end": False}
+        d = make_dialog(f"Pobierz – {profile(pid)['name']}", 1040, 660, resizable=True)
+        dl = {"win": d, "kind": kind, "source": "modrinth", "results": [], "key": None, "req": 0, "end": False,
+              "details": {}, "icons": {}, "detail_req": 0, "links": []}
         state["downloaders"][pid] = dl
+
+        tabs = tk.Frame(d, bg=PANEL)
+        tabs.pack(fill="x")
+        kind_buttons, source_buttons = {}, {}
+        for key, t in CONTENT_TYPES.items():
+            button = make_button(tabs, t["label"], lambda k=key: set_kind(k))
+            button.pack(side="left", padx=(12 if not kind_buttons else 2, 0), pady=(10, 0))
+            kind_buttons[key] = button
+        for key, label in (("curseforge", "CurseForge"), ("modrinth", "Modrinth")):
+            button = make_button(tabs, label, lambda k=key: set_source(k))
+            button.pack(side="right", padx=(2, 12 if key == "curseforge" else 0), pady=(10, 0))
+            source_buttons[key] = button
 
         top = tk.Frame(d, bg=PANEL)
         top.pack(fill="x")
-        source_buttons = {}
-        for key, label in (("modrinth", "Modrinth"), ("curseforge", "CurseForge")):
-            button = make_button(top, label, lambda k=key: set_source(k))
-            button.pack(side="left", padx=(12 if key == "modrinth" else 2, 0), pady=10)
-            source_buttons[key] = button
         query = make_entry(top)
-        query.pack(side="left", fill="x", expand=True, padx=(14, 8), ipady=4)
+        query.pack(side="left", fill="x", expand=True, padx=(12, 8), pady=10, ipady=4)
         sort_cb = make_combobox(top, [s[0] for s in SORTS], readonly=True)
         sort_cb.set(SORTS[0][0])
         sort_cb.pack(side="left")
@@ -1620,10 +2183,12 @@ def run_gui():
         info = make_label(bottom, "", 12, MUTED, bg=PANEL)
         info.pack(side="left", padx=6)
         make_button(bottom, "Zamknij", lambda: close()).pack(side="right", padx=12)
+        target = make_label(bottom, "", 12, MUTED, bg=PANEL)
+        target.pack(side="right", padx=6)
 
         content = tk.Frame(d, bg=BG)
         content.pack(fill="both", expand=True)
-        details = tk.Frame(content, bg=PANEL, width=320)
+        details = tk.Frame(content, bg=PANEL, width=380)
         details.pack(side="right", fill="y")
         details.pack_propagate(False)
         results_lb = make_listbox(content, 20)
@@ -1631,49 +2196,151 @@ def run_gui():
         results_lb.configure(yscrollcommand=results_scroll.set)
         results_scroll.pack(side="right", fill="y", pady=12)
         results_lb.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=12)
-        det_title = make_label(details, "", 17, TEXT, bold=True, bg=PANEL, wraplength=290)
-        det_title.pack(fill="x", padx=16, pady=(16, 2))
-        det_meta = make_label(details, "", 12, MUTED, bg=PANEL, wraplength=290)
+
+        head = tk.Frame(details, bg=PANEL)
+        head.pack(fill="x", padx=16, pady=(16, 6))
+        icon_lbl = tk.Label(head, bg=PANEL)
+        icon_lbl.pack(side="left", padx=(0, 12))
+        head_text = tk.Frame(head, bg=PANEL)
+        head_text.pack(side="left", fill="x", expand=True)
+        det_title = make_label(head_text, "", 17, TEXT, bold=True, bg=PANEL, wraplength=250)
+        det_title.pack(fill="x")
+        det_author = make_label(head_text, "", 12, MUTED, bg=PANEL, wraplength=250)
+        det_author.pack(fill="x")
+        det_meta = make_label(details, "", 12, MUTED, bg=PANEL, wraplength=340)
         det_meta.pack(fill="x", padx=16)
-        det_desc = make_label(details, "Wybierz mod z listy.", 13, TEXT, bg=PANEL, wraplength=290)
-        det_desc.pack(fill="x", padx=16, pady=(12, 0))
+        links_frame = tk.Frame(details, bg=PANEL)
+        links_frame.pack(fill="x", padx=14, pady=(8, 2))
         install_btn = make_button(details, "Zainstaluj", lambda: install(), "primary")
         install_btn.pack(side="bottom", fill="x", padx=16, pady=(6, 16), ipady=3)
-        page_btn = make_button(details, "Strona moda", lambda: open_page())
-        page_btn.pack(side="bottom", fill="x", padx=16)
-        det_msg = make_label(details, "", 12, MUTED, bg=PANEL, wraplength=290)
+        det_msg = make_label(details, "", 12, MUTED, bg=PANEL, wraplength=340)
         det_msg.pack(side="bottom", fill="x", padx=16)
+        desc = tk.Text(details, bg=PANEL, fg=TEXT, relief="flat", bd=0, wrap="word", font=font(12), padx=0, pady=4,
+                       highlightthickness=0, cursor="arrow", height=10)
+        desc_scroll = ttk.Scrollbar(details, orient="vertical", command=desc.yview)
+        desc.configure(yscrollcommand=desc_scroll.set)
+        desc_scroll.pack(side="right", fill="y", pady=8)
+        desc.pack(fill="both", expand=True, padx=(16, 0), pady=8)
+
+        def set_desc(text):
+            desc.config(state="normal")
+            desc.delete("1.0", "end")
+            desc.insert("1.0", text)
+            desc.config(state="disabled")
+
+        def set_links(links):
+            for button in dl["links"]:
+                button.destroy()
+            dl["links"] = []
+            for i, (label, url) in enumerate(links[:6]):
+                button = make_button(links_frame, label, lambda u=url: webbrowser.open(u))
+                button.grid(row=i // 2, column=i % 2, sticky="we", padx=2, pady=2)
+                dl["links"].append(button)
+            links_frame.columnconfigure(0, weight=1)
+            links_frame.columnconfigure(1, weight=1)
 
         def installed_keys():
-            return {(i.get("source"), str(i.get("id"))) for i in load_mods_index(profile_dir(pid)).values()}
+            kind, game_dir = dl["kind"], profile_dir(pid)
+            if kind == "modpack":
+                return {(p["pack"].get("source"), str(p["pack"].get("id")))
+                        for p in pdata["profiles"].values() if p.get("pack")}
+            if kind == "mod":
+                index = load_mods_index(game_dir)
+            elif kind == "resourcepack":
+                index = _load_index(resourcepack_index(game_dir))
+            else:
+                return set()  # paczki danych należą do konkretnych światów
+            return {(i.get("source"), str(i.get("id"))) for i in index.values()}
 
         def selected():
             sel = results_lb.curselection()
             return dl["results"][sel[0]] if sel and sel[0] < len(dl["results"]) else None
 
+        def update_install_button(r):
+            kind = dl["kind"]
+            text = {"mod": "Zainstaluj", "resourcepack": "Zainstaluj", "datapack": "Dodaj do świata…",
+                    "modpack": "Zainstaluj jako nowy profil"}[kind]
+            if kind in ("mod", "resourcepack") and (r["source"], str(r["id"])) in installed_keys():
+                text = "Zainstaluj ponownie / zaktualizuj"
+            install_btn.config(text=text, state="normal")
+
+        def show_icon(r, req):
+            icon_lbl.config(image="")
+            url = r.get("icon") or ""
+            if not url:
+                return
+            if url in dl["icons"]:
+                if dl["icons"][url]:
+                    icon_lbl.config(image=dl["icons"][url])
+                return
+
+            def done(data):
+                img = None
+                if data:
+                    try:
+                        img = tk.PhotoImage(data=base64.b64encode(data).decode("ascii"))
+                        factor = max(1, img.width() // 64)
+                        if factor > 1:
+                            img = img.subsample(factor)
+                    except Exception:  # nieobslugiwany format albo uszkodzony plik
+                        img = None
+                dl["icons"][url] = img  # referencja, zeby obraz nie zniknal
+                if img and alive(d) and req == dl["detail_req"]:
+                    icon_lbl.config(image=img)
+
+            background(lambda: fetch_icon(url), done, lambda msg: dl["icons"].__setitem__(url, None))
+
+        def apply_details(r, extra):
+            meta = [f"{format_count(r['downloads'])} pobrań"]
+            if extra.get("followers"):
+                meta.append(f"{format_count(int(extra['followers']))} obserwujących")
+            if extra.get("updated"):
+                meta.append(f"aktualizacja: {extra['updated']}")
+            if extra.get("license"):
+                meta.append(f"licencja: {extra['license']}")
+            text = "  ·  ".join(meta)
+            if extra.get("categories"):
+                text += "\nKategorie: " + ", ".join(extra["categories"][:8])
+            det_meta.config(text=text)
+            set_desc(extra.get("description") or r.get("description") or "Brak opisu.")
+            links = extra.get("links") or ([("Strona projektu", r["url"])] if str(r.get("url", "")).startswith("https://") else [])
+            set_links(links)
+
         def show_details(_event=None):
             r = selected()
+            dl["detail_req"] += 1
+            req = dl["detail_req"]
             if not r:
-                det_title.config(text="")
-                det_meta.config(text="")
-                det_desc.config(text="Wybierz mod z listy.")
-                install_btn.config(text="Zainstaluj", state="disabled")
-                page_btn.config(state="disabled")
+                for widget in (det_title, det_author, det_meta):
+                    widget.config(text="")
+                icon_lbl.config(image="")
+                set_desc("Wybierz pozycję z listy, żeby zobaczyć opis.")
+                set_links([])
+                install_btn.config(state="disabled")
                 return
-            meta = [f"{format_count(r['downloads'])} pobrań"]
-            if r.get("author"):
-                meta.insert(0, f"autor: {r['author']}")
             det_title.config(text=r["title"])
-            det_meta.config(text="  ·  ".join(meta))
-            det_desc.config(text=shorten(r.get("description", ""), 400))
-            have = (r["source"], str(r["id"])) in installed_keys()
-            install_btn.config(text="Zainstaluj ponownie / zaktualizuj" if have else "Zainstaluj", state="normal")
-            page_btn.config(state="normal" if str(r.get("url", "")).startswith("https://") else "disabled")
+            det_author.config(text=f"autor: {r['author']}" if r.get("author") else "")
+            det_meta.config(text=f"{format_count(r['downloads'])} pobrań")
+            set_desc((r.get("description") or "") + "\n\nWczytuję pełny opis…")
+            set_links([("Strona projektu", r["url"])] if str(r.get("url", "")).startswith("https://") else [])
+            update_install_button(r)
+            show_icon(r, req)
+            cache_key = (r["source"], str(r["id"]))
+            if cache_key in dl["details"]:
+                return apply_details(r, dl["details"][cache_key])
+            key = curseforge_key(cfg)
 
-        def open_page():
-            r = selected()
-            if r and str(r.get("url", "")).startswith("https://"):
-                webbrowser.open(r["url"])
+            def done(extra):
+                dl["details"][cache_key] = extra
+                if alive(d) and req == dl["detail_req"]:
+                    apply_details(r, extra)
+
+            def fail(msg):
+                write_log(f"Nie udało się pobrać opisu „{r['title']}”: {msg}")
+                if alive(d) and req == dl["detail_req"]:
+                    set_desc(r.get("description") or "Nie udało się wczytać opisu.")
+
+            background(lambda: project_details(r, key), done, fail)
 
         def render():
             have = installed_keys()
@@ -1690,7 +2357,7 @@ def run_gui():
             problem = None
             if not p:
                 problem = "Ten profil został usunięty."
-            elif not p.get("use_fabric", True):
+            elif dl["kind"] == "mod" and not p.get("use_fabric", True):
                 problem = "Ten profil nie ma Fabrica. Włącz go w edycji profilu."
             elif dl["source"] == "curseforge" and not curseforge_key(cfg):
                 problem = "Ta wersja nie ma wbudowanego klucza CurseForge. Wpisz własny w Ustawieniach."
@@ -1702,15 +2369,15 @@ def run_gui():
             return True
 
         def load(more=False, force=False):
-            """Bez wpisanego tekstu pokazuje najpopularniejsze mody; more=True doczytuje kolejna strone."""
+            """Bez wpisanego tekstu pokazuje najpopularniejsze pozycje; more=True doczytuje kolejną stronę."""
             if not ready():
                 return
-            text, src, key = query.get().strip(), dl["source"], curseforge_key(cfg)
+            kind, src, text, key = dl["kind"], dl["source"], query.get().strip(), curseforge_key(cfg)
             sort = dict(SORTS).get(sort_cb.get(), "downloads") if src == "modrinth" else None
             if src == "modrinth" and not text and sort == "relevance":
-                sort = "downloads"  # bez zapytania "trafnosc" nie ma sensu
+                sort = "downloads"  # bez zapytania "trafność" nie ma sensu
             wanted = profile(pid)["game_version"]
-            request_key = (src, wanted, text, sort)
+            request_key = (kind, src, wanted, text, sort)
             if more and (dl["key"] != request_key or dl["end"]):
                 return
             if not more and not force and request_key == dl["key"] and dl["results"]:
@@ -1718,18 +2385,16 @@ def run_gui():
             offset = len(dl["results"]) if more else 0
             dl["req"] += 1
             req = dl["req"]
-            info.config(text="Wczytuję kolejne…" if more else ("Szukam…" if text else "Wczytuję najpopularniejsze mody…"),
+            info.config(text="Wczytuję kolejne…" if more else ("Szukam…" if text else "Wczytuję najpopularniejsze…"),
                         fg=MUTED)
 
             def job():
                 version = resolve_game_version(wanted)
-                if src == "modrinth":
-                    return version, modrinth_search(text, version, PAGE, offset, sort)
-                return version, curseforge_search(text, version, key, PAGE, offset)
+                return version, search_content(kind, src, text, version, key, PAGE, offset, sort)
 
             def done(result):
                 if req != dl["req"] or not alive(d):
-                    return  # w miedzyczasie zlecono nowsze wyszukiwanie albo okno zamknieto
+                    return  # w międzyczasie zlecono nowsze wyszukiwanie albo okno zamknięto
                 version, hits = result
                 if more:
                     seen = {(h["source"], str(h["id"])) for h in dl["results"]}
@@ -1740,14 +2405,16 @@ def run_gui():
                 dl["key"], dl["end"] = request_key, len(hits) < PAGE
                 render()
                 where = "Modrinth" if src == "modrinth" else "CurseForge"
+                label = CONTENT_TYPES[kind]["label"].lower()
+                for_version = "" if kind == "modpack" else f" dla Minecraft {version}"
                 if not dl["results"]:
-                    info.config(text=f"Brak modów dla Minecraft {version} z Fabric", fg=MUTED)
+                    info.config(text=f"{where}: brak wyników{for_version}", fg=MUTED)
                 elif text:
-                    info.config(text=f"{where}: {len(dl['results'])} wyników dla „{shorten(text, 30)}” "
-                                     f"(Minecraft {version})", fg=MUTED)
+                    info.config(text=f"{where}: {len(dl['results'])} wyników dla „{shorten(text, 30)}”{for_version}",
+                                fg=MUTED)
                 else:
-                    info.config(text=f"{where}: najpopularniejsze mody dla Minecraft {version} "
-                                     f"({len(dl['results'])})", fg=MUTED)
+                    info.config(text=f"{where}: najpopularniejsze {label}{for_version} ({len(dl['results'])})",
+                                fg=MUTED)
 
             def fail(msg):
                 if req == dl["req"] and alive(d):
@@ -1756,6 +2423,21 @@ def run_gui():
 
             background(job, done, fail)
 
+        def update_target():
+            name = profile(pid)["name"] if pid in pdata["profiles"] else "?"
+            target.config(text={"mod": f"Instalacja do profilu „{shorten(name, 24)}”",
+                                "resourcepack": f"Instalacja do profilu „{shorten(name, 24)}”",
+                                "datapack": "Paczka danych trafi do wybranego świata",
+                                "modpack": "Modpack zostanie zainstalowany jako nowy profil"}[dl["kind"]])
+
+        def set_kind(kind):
+            dl["kind"] = kind
+            for key, button in kind_buttons.items():
+                button.config(bg=SELECT if key == kind else PANEL2)
+            d.title(f"{CONTENT_TYPES[kind]['label']} – Zorza Client")
+            update_target()
+            load()
+
         def set_source(src):
             dl["source"] = src
             for key, button in source_buttons.items():
@@ -1763,39 +2445,70 @@ def run_gui():
             sort_cb.config(state="readonly" if src == "modrinth" else "disabled")
             load()
 
+        dl["set_kind"] = set_kind
+
         def install():
             r = selected()
             if not r:
-                return det_msg.config(text="Zaznacz mod na liście.", fg=RED)
+                return det_msg.config(text="Zaznacz pozycję na liście.", fg=RED)
             if not ready():
                 return
+            kind, key = dl["kind"], curseforge_key(cfg)
+            if kind == "modpack":
+                def finished(name, error=None):
+                    if alive(d):
+                        det_msg.config(text=error or f"Gotowe: utworzono profil „{name}”.", fg=RED if error else GREEN)
+                        if not error:
+                            render()
+
+                if start_modpack_install(lambda game_dir, prog: install_modpack(r, game_dir, key, prog), r["title"],
+                                         {"source": r["source"], "id": str(r["id"])}, finished):
+                    det_msg.config(text=f"Instaluję modpack „{r['title']}”… Postęp widać na dole głównego okna.",
+                                   fg=MUTED)
+                else:
+                    det_msg.config(text="Inny modpack właśnie się instaluje.", fg=RED)
+                return
             if is_active(pid):
-                return det_msg.config(text="Zamknij grę przed instalowaniem modów.", fg=RED)
-            wanted, key, game_dir = profile(pid)["game_version"], curseforge_key(cfg), profile_dir(pid)
-            install_btn.config(state="disabled")
-            det_msg.config(text=f"Instaluję: {r['title']}…", fg=MUTED)
+                return det_msg.config(text="Zamknij grę przed instalowaniem.", fg=RED)
+            wanted, game_dir = profile(pid)["game_version"], profile_dir(pid)
 
-            def job():
-                names = []
-                try:
-                    install_mod(r, resolve_game_version(wanted), game_dir, key, names.append)
-                except LauncherError as e:
-                    raise LauncherError(str(e) + (f" (pobrano już: {', '.join(names)})" if names else ""))
-                return names
+            def run(target_dir, index_path, where=""):
+                install_btn.config(state="disabled")
+                det_msg.config(text=f"Instaluję: {r['title']}…", fg=MUTED)
 
-            def done(names):
-                mods_changed(pid)
-                if alive(d):
-                    det_msg.config(text="Zainstalowano: " + ", ".join(names), fg=GREEN)
-                set_status(f"Zainstalowano w profilu „{profile(pid)['name']}”: {', '.join(names)}")
+                def job():
+                    names = []
+                    version = resolve_game_version(wanted)
+                    try:
+                        if kind == "mod":
+                            install_mod(r, version, game_dir, key, names.append)
+                        else:
+                            install_pack(r, kind, version, target_dir, index_path, key, names.append)
+                    except LauncherError as e:
+                        raise LauncherError(str(e) + (f" (pobrano już: {', '.join(names)})" if names else ""))
+                    return names
 
-            def fail(msg):
-                mods_changed(pid)  # czesc zaleznosci mogla sie juz pobrac
-                if alive(d):
-                    det_msg.config(text=msg, fg=RED)
-                write_log("BŁĄD: " + msg)
+                def done(names):
+                    mods_changed(pid)
+                    if alive(d):
+                        det_msg.config(text="Zainstalowano: " + ", ".join(names) + where, fg=GREEN)
+                    set_status(f"Zainstalowano w profilu „{profile(pid)['name']}”: {', '.join(names)}{where}")
 
-            background(job, done, fail)
+                def fail(msg):
+                    mods_changed(pid)  # część zależności mogła się już pobrać
+                    if alive(d):
+                        det_msg.config(text=msg, fg=RED)
+                    write_log("BŁĄD: " + msg)
+
+                background(job, done, fail)
+
+            if kind == "mod":
+                run(game_dir / "mods", None)
+            elif kind == "resourcepack":
+                run(game_dir / "resourcepacks", resourcepack_index(game_dir))
+            else:
+                pick_world(pid, d, lambda world: run(world / "datapacks", world / "zorza_datapacks.json",
+                                                     f" (świat: {world.name})"))
 
         def close():
             state["downloaders"].pop(pid, None)
@@ -1806,7 +2519,10 @@ def run_gui():
         query.bind("<Return>", lambda e: load(force=True))
         sort_cb.bind("<<ComboboxSelected>>", lambda e: load(force=True))
         d.protocol("WM_DELETE_WINDOW", close)
-        set_source("modrinth")  # od razu wczytuje najpopularniejsze mody
+        dl["source"] = "modrinth"
+        for key, button in source_buttons.items():
+            button.config(bg=SELECT if key == "modrinth" else PANEL2)
+        set_kind(kind)  # od razu wczytuje najpopularniejsze pozycje
         query.focus_set()
 
     # ============================================================ ustawienia, konsola

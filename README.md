@@ -12,6 +12,7 @@ Zorza Client is a hobby launcher for **Minecraft: Java Edition** that installs F
 - Keeps its files in a separate folder (`.zorza`), so it does not touch the official launcher's installation.
 - Prism-style layout: profile tiles, side panel with actions, profile editor (version, mods, per-profile RAM and JVM arguments) and a separate mod browser.
 - Profiles: each profile has its own game folder (mods, worlds, options), game version and Fabric toggle. Mods can be enabled or disabled without deleting them.
+- Browses and installs **modpacks** (Modrinth `.mrpack` and CurseForge Fabric packs, also from a local file), **resource packs** and **data packs** (into a chosen world), with a details panel showing the full description, links, license and categories.
 - Installs Fabric mods from **Modrinth** and **CurseForge** (CurseForge requires the user's own API key), including required dependencies. Mods whose authors disallow third-party distribution are not downloaded.
 
 ## What it does not do
@@ -51,6 +52,8 @@ Zorza Client to hobbystyczny launcher do **Minecraft: Java Edition**, który ins
 - Nie rozpowszechnia plików gry i nie zawiera cheatów.
 - Profile z osobnymi folderami gry oraz instalowanie modów Fabric z Modrinth i CurseForge (CurseForge wymaga własnego klucza API).
 - Lokalnie zapisuje tylko token odświeżania Microsoft (`auth.json`), żeby nie trzeba było logować się za każdym razem.
+
+Modpacki (Modrinth i CurseForge), paczki zasobów i paczki danych, podgląd pełnego opisu i linków.
 
 Uruchamianie: `python zorza_launcher.py` (wymaga Pythona 3.9+).
 
