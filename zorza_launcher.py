@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 NAME = "Zorza Client"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 UA = f"RastamanPoland/zorza-client/{VERSION} (github.com/RastamanPoland/zorza-client)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -614,9 +614,11 @@ def _store_mod(game_dir, url, filename, sha1, size, source, project_id, title, v
     save_mods_index(game_dir, index)
 
 
-def modrinth_search(query: str, game_version: str, limit: int = 30) -> list:
+def modrinth_search(query: str, game_version: str, limit: int = 30, offset: int = 0) -> list:
+    """Bez zapytania zwraca najpopularniejsze mody (sortowanie po liczbie pobran)."""
     facets = [["project_type:mod"], ["categories:fabric"], [f"versions:{game_version}"]]
-    params = {"limit": limit, "facets": json.dumps(facets), "index": "relevance" if query else "downloads"}
+    params = {"limit": limit, "offset": offset, "facets": json.dumps(facets),
+              "index": "relevance" if query else "downloads"}
     if query:
         params["query"] = query
     hits = get_json(f"{MODRINTH}/search?{urllib.parse.urlencode(params)}").get("hits", [])
@@ -667,9 +669,10 @@ def curseforge_get(path: str, api_key: str):
         raise
 
 
-def curseforge_search(query: str, game_version: str, api_key: str, limit: int = 30) -> list:
+def curseforge_search(query: str, game_version: str, api_key: str, limit: int = 30, offset: int = 0) -> list:
+    """Bez zapytania zwraca najpopularniejsze mody."""
     params = {"gameId": 432, "classId": 6, "modLoaderType": 4, "gameVersion": game_version,
-              "pageSize": limit}
+              "pageSize": limit, "index": offset}
     if query:
         params["searchFilter"] = query
     else:
@@ -810,7 +813,9 @@ def run_gui():
     cfg = load_config()
     pdata = load_profiles(cfg)
     events = queue.Queue()
-    state = {"account": None, "busy": False, "view": "play", "results": [], "installed": []}
+    state = {"account": None, "busy": False, "view": "play", "results": [], "installed": [],
+             "results_key": None, "results_req": 0, "results_end": False}
+    PAGE = 30
 
     def profile():
         return pdata["profiles"][pdata["selected"]]
@@ -936,6 +941,7 @@ def run_gui():
         refresh_profile_labels()
         if state["view"] == "mods":
             refresh_installed()
+            load_results()
         elif state["view"] == "settings":
             load_settings_fields()
 
@@ -948,14 +954,14 @@ def run_gui():
     source = tk.StringVar(value="modrinth")
     for value, label in (("modrinth", "Modrinth"), ("curseforge", "CurseForge")):
         tk.Radiobutton(search_row, text=label, value=value, variable=source, bg=BG, fg=TEXT,
-                       selectcolor=PANEL, activebackground=BG, activeforeground=TEXT,
-                       highlightthickness=0, font=font(13)).pack(side="left", padx=(0, 10))
+                       selectcolor=PANEL, activebackground=BG, activeforeground=TEXT, highlightthickness=0,
+                       font=font(13), command=lambda: load_results()).pack(side="left", padx=(0, 10))
     query = make_entry(search_row)
     query.pack(side="left", fill="x", expand=True, padx=(6, 10), ipady=5)
     results_lb = make_listbox(mods, 8)
     description = make_label(mods, size=12, color=MUTED, wraplength=W - 48)
     install_row = tk.Frame(mods, bg=BG)
-    mods_msg = make_label(install_row, size=12, color=MUTED, wraplength=W - 220)
+    mods_msg = make_label(install_row, size=12, color=MUTED, wraplength=W - 330)
     installed_lb = make_listbox(mods, 6)
     installed_row = tk.Frame(mods, bg=BG)
 
@@ -979,29 +985,69 @@ def run_gui():
             return False
         return True
 
-    def do_search(_event=None):
+    def installed_keys():
+        return {(i.get("source"), str(i.get("id"))) for i in load_mods_index(current_dir()).values()}
+
+    def render_results():
+        have = installed_keys()
+        results_lb.delete(0, "end")
+        for h in state["results"]:
+            mark = "✓  " if (h["source"], str(h["id"])) in have else "     "
+            results_lb.insert("end", f"{mark}{h['title']}   ·   {format_count(h['downloads'])} pobrań")
+
+    def load_results(more=False, force=False):
+        """Bez wpisanego tekstu pokazuje najpopularniejsze mody; more=True doczytuje kolejna strone."""
         if not mods_ready():
             return
         text, src, key = query.get().strip(), source.get(), cfg.get("curseforge_api_key", "")
         wanted = profile()["game_version"]
-        set_mods_msg("Szukam…")
+        request_key = (src, pdata["selected"], wanted, text)
+        if more and (state["results_key"] != request_key or state["results_end"]):
+            return
+        if not more and not force and request_key == state["results_key"] and state["results"]:
+            return render_results()  # ta sama lista jest juz wczytana
+        offset = len(state["results"]) if more else 0
+        state["results_req"] += 1
+        req = state["results_req"]
+        set_mods_msg("Wczytuję kolejne…" if more else ("Szukam…" if text else "Wczytuję najpopularniejsze mody…"))
 
         def job():
             version = resolve_game_version(wanted)
-            hits = modrinth_search(text, version) if src == "modrinth" else curseforge_search(text, version, key)
+            if src == "modrinth":
+                hits = modrinth_search(text, version, PAGE, offset)
+            else:
+                hits = curseforge_search(text, version, key, PAGE, offset)
             return version, hits
 
         def done(result):
+            if req != state["results_req"]:
+                return  # w miedzyczasie zlecono nowsze wyszukiwanie
             version, hits = result
-            state["results"] = hits
-            results_lb.delete(0, "end")
-            for h in hits:
-                results_lb.insert("end", f"{h['title']}   ·   {format_count(h['downloads'])} pobrań")
-            description.config(text="")
-            set_mods_msg(f"Znaleziono {len(hits)} modów dla Minecraft {version}" if hits
-                         else f"Brak modów dla Minecraft {version} z Fabric")
+            if more:
+                seen = {(h["source"], str(h["id"])) for h in state["results"]}
+                hits = [h for h in hits if (h["source"], str(h["id"])) not in seen]
+                state["results"] += hits
+            else:
+                state["results"] = hits
+                description.config(text="")
+            state["results_key"], state["results_end"] = request_key, len(hits) < PAGE
+            render_results()
+            where = "Modrinth" if src == "modrinth" else "CurseForge"
+            if not state["results"]:
+                set_mods_msg(f"Brak modów dla Minecraft {version} z Fabric")
+            elif text:
+                set_mods_msg(f"{where}: {len(state['results'])} wyników dla „{text}” (Minecraft {version})")
+            else:
+                set_mods_msg(f"{where}: najpopularniejsze mody dla Minecraft {version} ({len(state['results'])})")
 
-        background(job, done, set_mods_msg)
+        def failed(msg, error=True):
+            if req == state["results_req"]:
+                set_mods_msg(msg, error)
+
+        background(job, done, failed)
+
+    def do_search(_event=None):
+        load_results(force=True)
 
     def selected_index(listbox, items):
         sel = listbox.curselection()
@@ -1032,10 +1078,12 @@ def run_gui():
 
         def done(names):
             refresh_installed()
+            render_results()
             set_mods_msg("Zainstalowano: " + ", ".join(names))
 
         def failed(msg, error=True):
             refresh_installed()  # czesc zaleznosci mogla sie juz pobrac
+            render_results()
             set_mods_msg(msg, error)
 
         background(job, done, failed)
@@ -1054,6 +1102,7 @@ def run_gui():
         except (OSError, LauncherError) as e:
             set_mods_msg(f"Nie udało się usunąć: {e}", True)
         refresh_installed()
+        render_results()
 
     make_button(search_row, "Szukaj", do_search, primary=True).pack(side="left")
     query.bind("<Return>", do_search)
@@ -1062,6 +1111,7 @@ def run_gui():
     description.pack(fill="x", padx=24)
     install_row.pack(fill="x", padx=24, pady=(6, 6))
     make_button(install_row, "Zainstaluj", do_install, primary=True).pack(side="left")
+    make_button(install_row, "Pokaż więcej", lambda: load_results(more=True)).pack(side="left", padx=(8, 0))
     mods_msg.pack(side="left", padx=12)
     make_label(mods, "Zainstalowane w tym profilu", size=13, bold=True).pack(fill="x", padx=24, pady=(8, 4))
     installed_lb.pack(fill="x", padx=24)
@@ -1069,7 +1119,7 @@ def run_gui():
     make_button(installed_row, "Usuń", do_remove).pack(side="left")
     make_button(installed_row, "Otwórz folder mods",
                 lambda: open_folder(current_dir() / "mods")).pack(side="left", padx=8)
-    make_button(installed_row, "Odśwież", refresh_installed).pack(side="left")
+    make_button(installed_row, "Odśwież", lambda: (refresh_installed(), render_results())).pack(side="left")
 
     # ====================================================== widok USTAWIENIA
     sett = tk.Frame(win, bg=BG)
@@ -1204,6 +1254,7 @@ def run_gui():
             refresh_profile_labels()
             refresh_installed()
             mods.place(x=0, y=TOP, width=W, height=H - TOP)
+            load_results()  # najpopularniejsze mody od razu po otwarciu zakladki
         elif view == "settings":
             load_settings_fields()
             sett.place(x=0, y=TOP, width=W, height=H - TOP)
