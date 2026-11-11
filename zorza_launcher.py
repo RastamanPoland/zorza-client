@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Zorza Client 0.1 - launcher Minecraft: Java Edition z Fabric Loaderem.
 
+Profile, ustawienia i instalowanie modow z Modrinth oraz CurseForge.
+
 Uruchamianie:   python zorza_launcher.py          (okno)
                 python zorza_launcher.py --cli    (terminal)
 
@@ -29,8 +31,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 NAME = "Zorza Client"
-VERSION = "0.1.0"
-UA = f"ZorzaClient/{VERSION}"
+VERSION = "0.2.0"
+UA = f"RastamanPoland/zorza-client/{VERSION} (github.com/RastamanPoland/zorza-client)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 RESOURCES_URL = "https://resources.download.minecraft.net"
@@ -61,6 +63,9 @@ ROOT = root_dir()
 LIBS, ASSETS, VERSIONS = ROOT / "libraries", ROOT / "assets", ROOT / "versions"
 RUNTIMES, GAME_DIR = ROOT / "runtimes", ROOT / "game"
 CONFIG_FILE, AUTH_FILE = ROOT / "config.json", ROOT / "auth.json"
+PROFILES_FILE, PROFILES_DIR = ROOT / "profiles.json", ROOT / "profiles"
+MODRINTH = "https://api.modrinth.com/v2"
+CURSEFORGE = "https://api.curseforge.com/v1"
 
 DEFAULT_CONFIG = {
     "msa_client_id": "",      # ID aplikacji z Azure (wymaga zgody Mojangu na API)
@@ -68,6 +73,7 @@ DEFAULT_CONFIG = {
     "use_fabric": True,
     "memory_mb": 4096,
     "java_path": "",          # puste = pobierz Jave od Mojangu
+    "curseforge_api_key": "",  # potrzebny tylko do modow z CurseForge
 }
 
 
@@ -406,7 +412,7 @@ class MicrosoftAuth:
 
 # -------------------------------------------------------------- uruchamianie
 
-def build_command(v, account, java, classpath, cfg) -> list:
+def build_command(v, account, java, classpath, cfg, game_dir=None) -> list:
     vid = v["_id"]
     client_jar = VERSIONS / vid / f"{vid}.jar"
     natives = VERSIONS / vid / "natives"
@@ -416,7 +422,7 @@ def build_command(v, account, java, classpath, cfg) -> list:
         "auth_access_token": account["token"], "auth_xuid": "", "clientid": "",
         "user_type": "msa", "user_properties": "{}",
         "version_name": vid, "version_type": v.get("type", "release"),
-        "game_directory": str(GAME_DIR), "assets_root": str(ASSETS),
+        "game_directory": str(game_dir or GAME_DIR), "assets_root": str(ASSETS),
         "assets_index_name": v["assetIndex"]["id"],
         "natives_directory": str(natives), "library_directory": str(LIBS),
         "launcher_name": NAME, "launcher_version": VERSION,
@@ -445,8 +451,9 @@ def build_command(v, account, java, classpath, cfg) -> list:
     return cmd
 
 
-def prepare_and_launch(cfg, account, log=print, progress=None) -> subprocess.Popen:
-    for d in (LIBS, ASSETS, VERSIONS, RUNTIMES, GAME_DIR / "mods"):
+def prepare_and_launch(cfg, account, log=print, progress=None, game_dir=None) -> subprocess.Popen:
+    game_dir = game_dir or GAME_DIR
+    for d in (LIBS, ASSETS, VERSIONS, RUNTIMES, game_dir / "mods"):
         d.mkdir(parents=True, exist_ok=True)
     log("Sprawdzam wersję…")
     v = resolve_version(cfg, log)
@@ -460,10 +467,263 @@ def prepare_and_launch(cfg, account, log=print, progress=None) -> subprocess.Pop
     log("Pobieram zasoby…")
     download_all(collect_assets(v), progress, workers=16)
     java = ensure_java(v, cfg, log, progress)
-    cmd = build_command(v, account, java, classpath, cfg)
+    cmd = build_command(v, account, java, classpath, cfg, game_dir)
     log(f"Uruchamiam grę jako {account['name']}…")
-    return subprocess.Popen(cmd, cwd=GAME_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    return subprocess.Popen(cmd, cwd=game_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, encoding="utf-8", errors="replace")
+
+
+# ------------------------------------------------------------ profile i mody
+
+_latest_release = None
+
+
+def fetch_manifest():
+    return get_json(MANIFEST_URL)
+
+
+def resolve_game_version(version: str) -> str:
+    """Zamienia 'latest' na numer najnowszego wydania (wynik jest zapamietywany)."""
+    global _latest_release
+    if version != "latest":
+        return version
+    if _latest_release is None:
+        _latest_release = fetch_manifest()["latest"]["release"]
+    return _latest_release
+
+
+def list_release_versions() -> list:
+    """Wydania obslugiwane przez launcher (1.19+), od najnowszego."""
+    out = []
+    for v in fetch_manifest()["versions"]:
+        if v.get("type") != "release":
+            continue
+        parts = v["id"].split(".")
+        try:
+            major, minor = int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+        except ValueError:
+            continue
+        if major > 1 or (major == 1 and minor >= 19):
+            out.append(v["id"])
+    return out
+
+
+def save_config(cfg: dict) -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2), "utf-8")
+
+
+def save_profiles(data: dict) -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    PROFILES_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
+
+
+def load_profiles(cfg: dict = None) -> dict:
+    """Profil = osobny folder gry (mody, swiaty, ustawienia) + wersja + Fabric."""
+    data = None
+    if PROFILES_FILE.exists():
+        try:
+            data = json.loads(PROFILES_FILE.read_text("utf-8"))
+        except ValueError:
+            data = None
+    if not data or not data.get("profiles"):
+        cfg = cfg or {}
+        data = {"selected": "default", "profiles": {"default": {
+            "name": "Domyślny",
+            "game_version": cfg.get("game_version", "latest"),
+            "use_fabric": bool(cfg.get("use_fabric", True)),
+        }}}
+        save_profiles(data)
+    if data.get("selected") not in data["profiles"]:
+        data["selected"] = next(iter(data["profiles"]))
+    return data
+
+
+def profile_dir(profile_id: str) -> Path:
+    return GAME_DIR if profile_id == "default" else PROFILES_DIR / profile_id
+
+
+def new_profile_id(name: str, existing) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "profil"
+    pid, n = base, 2
+    while pid in existing or pid == "default":
+        pid, n = f"{base}-{n}", n + 1
+    return pid
+
+
+def valid_game_version(text: str) -> bool:
+    return text == "latest" or re.fullmatch(r"\d+(\.\d+){1,2}", text) is not None
+
+
+def safe_jar_name(name: str) -> str:
+    name = Path(str(name).replace("\\", "/")).name
+    if not name.lower().endswith(".jar") or name.startswith("."):
+        raise LauncherError(f"Nieoczekiwana nazwa pliku moda: {name}")
+    return name
+
+
+def mods_index_file(game_dir: Path) -> Path:
+    return game_dir / "zorza_mods.json"
+
+
+def load_mods_index(game_dir: Path) -> dict:
+    try:
+        return json.loads(mods_index_file(game_dir).read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_mods_index(game_dir: Path, index: dict) -> None:
+    game_dir.mkdir(parents=True, exist_ok=True)
+    mods_index_file(game_dir).write_text(json.dumps(index, indent=2, ensure_ascii=False), "utf-8")
+
+
+def list_installed(game_dir: Path) -> list:
+    """Pliki .jar z folderu mods, z tytulami modow zainstalowanych przez launcher."""
+    index = load_mods_index(game_dir)
+    mods_dir = game_dir / "mods"
+    files = sorted(p.name for p in mods_dir.glob("*.jar")) if mods_dir.is_dir() else []
+    return [{"file": f, "title": index.get(f, {}).get("title", f),
+             "source": index.get(f, {}).get("source", "ręcznie")} for f in files]
+
+
+def remove_mod(game_dir: Path, filename: str) -> None:
+    name = safe_jar_name(filename)
+    path = game_dir / "mods" / name
+    if path.exists():
+        path.unlink()
+    index = load_mods_index(game_dir)
+    if index.pop(name, None) is not None:
+        save_mods_index(game_dir, index)
+
+
+def _store_mod(game_dir, url, filename, sha1, size, source, project_id, title, version):
+    """Pobiera plik moda, podmienia starsza wersje tego samego moda i zapisuje wpis."""
+    if not str(url).startswith("https://"):
+        raise LauncherError("Odrzucono adres pobierania, który nie używa HTTPS")
+    name = safe_jar_name(filename)
+    index = load_mods_index(game_dir)
+    for old, info in list(index.items()):
+        if info.get("source") == source and str(info.get("id")) == str(project_id) and old != name:
+            old_path = game_dir / "mods" / old
+            if old_path.exists():
+                old_path.unlink()
+            del index[old]
+    download(url, game_dir / "mods" / name, sha1, size)
+    index[name] = {"source": source, "id": str(project_id), "title": title, "version": version}
+    save_mods_index(game_dir, index)
+
+
+def modrinth_search(query: str, game_version: str, limit: int = 30) -> list:
+    facets = [["project_type:mod"], ["categories:fabric"], [f"versions:{game_version}"]]
+    params = {"limit": limit, "facets": json.dumps(facets), "index": "relevance" if query else "downloads"}
+    if query:
+        params["query"] = query
+    hits = get_json(f"{MODRINTH}/search?{urllib.parse.urlencode(params)}").get("hits", [])
+    return [{"source": "modrinth", "id": h["project_id"], "title": h.get("title", h["project_id"]),
+             "description": h.get("description", ""), "downloads": int(h.get("downloads", 0))} for h in hits]
+
+
+def modrinth_install(project_id, game_version, game_dir, log=print, title=None, _seen=None) -> None:
+    seen = _seen if _seen is not None else set()
+    if project_id in seen:
+        return
+    seen.add(project_id)
+    pid = urllib.parse.quote(str(project_id), safe="")
+    query = urllib.parse.urlencode({"loaders": json.dumps(["fabric"]),
+                                    "game_versions": json.dumps([game_version])})
+    versions = get_json(f"{MODRINTH}/project/{pid}/version?{query}")
+    if title is None:
+        title = get_json(f"{MODRINTH}/project/{pid}").get("title", str(project_id))
+    if not versions:
+        raise LauncherError(f"„{title}” nie ma wersji dla Minecraft {game_version} z Fabric")
+    ver = versions[0]
+    files = ver.get("files") or []
+    if not files:
+        raise LauncherError(f"„{title}” nie ma pliku do pobrania")
+    f = next((x for x in files if x.get("primary")), files[0])
+    _store_mod(game_dir, f["url"], f["filename"], f.get("hashes", {}).get("sha1"), f.get("size"),
+               "modrinth", project_id, title, ver.get("version_number", ""))
+    log(title)
+    for dep in ver.get("dependencies", []):
+        if dep.get("dependency_type") != "required":
+            continue
+        dep_id = dep.get("project_id")
+        if not dep_id and dep.get("version_id"):
+            vid = urllib.parse.quote(str(dep["version_id"]), safe="")
+            dep_id = get_json(f"{MODRINTH}/version/{vid}").get("project_id")
+        if dep_id:
+            modrinth_install(dep_id, game_version, game_dir, log, None, seen)
+
+
+def curseforge_get(path: str, api_key: str):
+    if not api_key:
+        raise LauncherError("Brak klucza API CurseForge. Wpisz go w Ustawieniach.")
+    try:
+        return get_json(CURSEFORGE + path, headers={"x-api-key": api_key})
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise LauncherError("CurseForge odrzucił klucz API (sprawdź go w Ustawieniach)")
+        raise
+
+
+def curseforge_search(query: str, game_version: str, api_key: str, limit: int = 30) -> list:
+    params = {"gameId": 432, "classId": 6, "modLoaderType": 4, "gameVersion": game_version,
+              "pageSize": limit}
+    if query:
+        params["searchFilter"] = query
+    else:
+        params.update({"sortField": 2, "sortOrder": "desc"})  # popularnosc
+    data = curseforge_get(f"/mods/search?{urllib.parse.urlencode(params)}", api_key).get("data", [])
+    return [{"source": "curseforge", "id": str(m["id"]), "title": m.get("name", str(m["id"])),
+             "description": m.get("summary", ""), "downloads": int(m.get("downloadCount", 0))} for m in data]
+
+
+def curseforge_install(mod_id, game_version, game_dir, api_key, log=print, title=None, _seen=None) -> None:
+    seen = _seen if _seen is not None else set()
+    mod_id = int(mod_id)
+    if mod_id in seen:
+        return
+    seen.add(mod_id)
+    if title is None:
+        title = curseforge_get(f"/mods/{mod_id}", api_key).get("data", {}).get("name", str(mod_id))
+    query = urllib.parse.urlencode({"gameVersion": game_version, "modLoaderType": 4, "pageSize": 20})
+    files = curseforge_get(f"/mods/{mod_id}/files?{query}", api_key).get("data", [])
+    if not files:
+        raise LauncherError(f"„{title}” nie ma wersji dla Minecraft {game_version} z Fabric")
+    f = sorted(files, key=lambda x: x.get("fileDate", ""), reverse=True)[0]
+    if not f.get("downloadUrl"):
+        raise LauncherError(f"Autor „{title}” nie pozwala pobierać moda przez zewnętrzne launchery. "
+                            "Pobierz plik ze strony CurseForge i wrzuć go do folderu mods.")
+    sha1 = next((h.get("value") for h in f.get("hashes", []) if h.get("algo") == 1), None)
+    _store_mod(game_dir, f["downloadUrl"], f["fileName"], sha1, f.get("fileLength"),
+               "curseforge", mod_id, title, f.get("displayName", ""))
+    log(title)
+    for dep in f.get("dependencies", []):
+        if dep.get("relationType") == 3 and dep.get("modId"):  # 3 = wymagana zaleznosc
+            curseforge_install(dep["modId"], game_version, game_dir, api_key, log, None, seen)
+
+
+def install_mod(hit: dict, game_version: str, game_dir: Path, curseforge_key: str = "", log=print) -> None:
+    if hit["source"] == "curseforge":
+        curseforge_install(hit["id"], game_version, game_dir, curseforge_key, log, hit.get("title"))
+    else:
+        modrinth_install(hit["id"], game_version, game_dir, log, hit.get("title"))
+
+
+def open_folder(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if OS_NAME == "windows":
+        os.startfile(str(path))  # noqa: tylko Windows
+    else:
+        subprocess.Popen(["open" if OS_NAME == "osx" else "xdg-open", str(path)])
+
+
+def format_count(n: int) -> str:
+    for limit, suffix in ((1_000_000, " mln"), (1_000, " tys.")):
+        if n >= limit:
+            return f"{n / limit:.1f}".rstrip("0").rstrip(".").replace(".", ",") + suffix
+    return str(n)
 
 
 # ---------------------------------------------------------------- interfejsy
@@ -481,7 +741,11 @@ def run_cli():
     def progress(done, total):
         print(f"\r  {done}/{total}", end="" if done < total else "\n", flush=True)
 
-    proc = prepare_and_launch(cfg, account, print, progress)
+    pdata = load_profiles(cfg)
+    p = pdata["profiles"][pdata["selected"]]
+    print(f"Profil: {p['name']}")
+    launch_cfg = dict(cfg, game_version=p["game_version"], use_fabric=bool(p.get("use_fabric", True)))
+    proc = prepare_and_launch(launch_cfg, account, print, progress, profile_dir(pdata["selected"]))
     for line in proc.stdout:
         print(line, end="")
     sys.exit(proc.wait())
@@ -534,17 +798,25 @@ def round_points(x1, y1, x2, y2, r):
 
 def run_gui():
     import tkinter as tk
+    from tkinter import messagebox, ttk
 
-    W, H, HEADER = 760, 640, 250
-    BG, PANEL, TEXT, MUTED = "#0b0d1a", "#11142a", "#e9ecff", "#8088a8"
-    GREEN, GREEN_HI, RED, OFF = "#3ddc97", "#6ff0b6", "#ff7a90", "#2a2f4a"
+    W, H, HEADER, TOP = 760, 640, 250, 48
+    BG, PANEL, TEXT, MUTED, LINE = "#0b0d1a", "#11142a", "#e9ecff", "#8088a8", "#1c2040"
+    GREEN, GREEN_HI, RED, OFF, SELECT = "#3ddc97", "#6ff0b6", "#ff7a90", "#2a2f4a", "#27407a"
 
     def font(px, *style):
         return ("Segoe UI", -px) + style  # ujemny rozmiar = piksele, uklad nie zalezy od DPI
 
     cfg = load_config()
+    pdata = load_profiles(cfg)
     events = queue.Queue()
-    state = {"account": None, "busy": False}
+    state = {"account": None, "busy": False, "view": "play", "results": [], "installed": []}
+
+    def profile():
+        return pdata["profiles"][pdata["selected"]]
+
+    def current_dir():
+        return profile_dir(pdata["selected"])
 
     win = tk.Tk()
     win.title(f"{NAME} {VERSION}")
@@ -554,7 +826,20 @@ def run_gui():
     cv = tk.Canvas(win, width=W, height=H, bg=BG, highlightthickness=0, bd=0)
     cv.pack()
 
-    # --- naglowek z zorza
+    try:  # ciemne listy rozwijane
+        style = ttk.Style(win)
+        style.theme_use("clam")
+        style.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=TEXT,
+                        arrowcolor=TEXT, bordercolor=LINE, lightcolor=PANEL, darkcolor=PANEL)
+        style.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", TEXT)],
+                  selectbackground=[("readonly", PANEL)], selectforeground=[("readonly", TEXT)])
+        for key, value in (("background", PANEL), ("foreground", TEXT),
+                           ("selectBackground", SELECT), ("selectForeground", TEXT)):
+            win.option_add(f"*TCombobox*Listbox.{key}", value)
+    except tk.TclError:
+        pass
+
+    # ===================================================== widok GRAJ (canvas)
     try:
         rows = render_aurora(W, HEADER)
         win.aurora = tk.PhotoImage(width=W, height=HEADER)  # referencja, zeby obraz nie zniknal
@@ -562,16 +847,15 @@ def run_gui():
         cv.create_image(0, 0, image=win.aurora, anchor="nw")
     except tk.TclError:
         pass  # bez obrazu zostaje samo ciemne tlo
-    cv.create_text(W // 2 + 2, 98, text="Z O R Z A", font=font(58, "bold"), fill="#05060f")
-    cv.create_text(W // 2, 96, text="Z O R Z A", font=font(58, "bold"), fill="#ffffff")
-    cv.create_text(W // 2, 148, text="C  L  I  E  N  T", font=font(15), fill="#b8f5da")
+    cv.create_text(W // 2 + 2, 108, text="Z O R Z A", font=font(58, "bold"), fill="#05060f")
+    cv.create_text(W // 2, 106, text="Z O R Z A", font=font(58, "bold"), fill="#ffffff")
+    cv.create_text(W // 2, 158, text="C  L  I  E  N  T", font=font(15), fill="#b8f5da")
 
-    # --- stan konta i kod logowania
+    profile_item = cv.create_text(W // 2, 226, text="", font=font(14, "bold"), fill="#d7dcff", tags="profile")
     status = cv.create_text(W // 2, 276, text="●  Niezalogowany", font=font(15), fill=MUTED)
     code_text = cv.create_text(W // 2, 312, text="", font=("Consolas", -30, "bold"), fill=GREEN)
     hint = cv.create_text(W // 2, 342, text="", font=font(12), fill=MUTED)
 
-    # --- glowny przycisk
     BX, BY, BW, BH = W // 2, 392, 300, 58
     btn_shape = cv.create_polygon(round_points(BX - BW / 2, BY - BH / 2, BX + BW / 2, BY + BH / 2, 16),
                                   smooth=True, fill=GREEN, outline="", tags="btn")
@@ -579,22 +863,372 @@ def run_gui():
                                fill="#06281b", tags="btn")
     logout = cv.create_text(W // 2, 438, text="", font=font(12, "underline"), fill=MUTED, tags="logout")
 
-    # --- pasek postepu i etap
     PX0, PX1, PY = 120, W - 120, 470
     cv.create_polygon(round_points(PX0, PY - 3, PX1, PY + 3, 3), smooth=True, fill=OFF, outline="")
     bar = cv.create_rectangle(PX0, PY - 3, PX0, PY + 3, fill=GREEN, outline="")
     stage = cv.create_text(W // 2, 490, text="", font=font(12), fill=MUTED, width=W - 160)
 
-    # --- log
     logbox = tk.Text(win, bg=PANEL, fg="#aab2d5", relief="flat", bd=0, padx=10, pady=8, wrap="none",
                      font=("Consolas", -12), insertbackground="#aab2d5", highlightthickness=1,
-                     highlightbackground="#1c2040", highlightcolor="#1c2040")
+                     highlightbackground=LINE, highlightcolor=LINE)
     cv.create_window(20, 512, window=logbox, anchor="nw", width=W - 40, height=96)
-    version_label = "najnowsza" if cfg["game_version"] == "latest" else cfg["game_version"]
-    cv.create_text(20, H - 14, anchor="w", font=font(11), fill="#565d80",
-                   text=f"Minecraft {version_label}" + (" + Fabric" if cfg.get("use_fabric") else ""))
+    footer = cv.create_text(20, H - 14, anchor="w", font=font(11), fill="#565d80", text="")
     cv.create_text(W - 20, H - 14, anchor="e", font=font(11), fill="#565d80", text=f"v{VERSION}")
 
+    # ============================================================ pomocnicze
+    def make_button(parent, text, command, primary=False):
+        return tk.Button(parent, text=text, command=command, relief="flat", bd=0, padx=14, pady=6,
+                         cursor="hand2", font=font(13, "bold") if primary else font(13),
+                         bg=GREEN if primary else LINE, fg="#06281b" if primary else TEXT,
+                         activebackground=GREEN_HI if primary else SELECT,
+                         activeforeground="#06281b" if primary else TEXT)
+
+    def make_entry(parent, **kw):
+        return tk.Entry(parent, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat", font=font(13),
+                        highlightthickness=1, highlightbackground=LINE, highlightcolor=GREEN, **kw)
+
+    def make_listbox(parent, height):
+        return tk.Listbox(parent, height=height, bg=PANEL, fg=TEXT, selectbackground=SELECT,
+                          selectforeground=TEXT, relief="flat", bd=0, highlightthickness=1,
+                          highlightbackground=LINE, highlightcolor=LINE, activestyle="none",
+                          font=font(13), exportselection=False)
+
+    def make_label(parent, text="", size=13, color=TEXT, bold=False, **kw):
+        return tk.Label(parent, text=text, bg=BG, fg=color, anchor="w", justify="left",
+                        font=font(size, "bold") if bold else font(size), **kw)
+
+    def set_entry(entry, value):
+        entry.delete(0, "end")
+        entry.insert(0, value)
+
+    def write_log(msg):
+        logbox.insert("end", str(msg) + "\n")
+        logbox.see("end")
+
+    def background(job, done, on_error):
+        """Uruchamia job() w watku; wynik lub blad wraca do okna przez kolejke."""
+        def run():
+            try:
+                result = job()
+            except LauncherError as e:
+                events.put(("ui", lambda m=str(e): on_error(m, True)))
+            except Exception as e:  # siec, nieoczekiwane odpowiedzi API
+                events.put(("ui", lambda m=f"{type(e).__name__}: {e}": on_error(m, True)))
+            else:
+                events.put(("ui", lambda: done(result)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def profile_summary():
+        p = profile()
+        version = "najnowsza" if p["game_version"] == "latest" else p["game_version"]
+        return f"Minecraft {version}" + (" + Fabric" if p.get("use_fabric") else " (bez modów)")
+
+    def refresh_profile_labels():
+        cv.itemconfig(profile_item, text=f"Profil: {profile()['name']}  ▾")
+        cv.itemconfig(footer, text=profile_summary())
+        mods_title.config(text=f"Mody  ·  {profile()['name']}  ·  {profile_summary()}")
+
+    def select_profile(pid):
+        if state["busy"] or pid not in pdata["profiles"]:
+            return
+        pdata["selected"] = pid
+        save_profiles(pdata)
+        refresh_profile_labels()
+        if state["view"] == "mods":
+            refresh_installed()
+        elif state["view"] == "settings":
+            load_settings_fields()
+
+    # ============================================================ widok MODY
+    mods = tk.Frame(win, bg=BG)
+    mods_title = make_label(mods, size=15, bold=True)
+    mods_title.pack(fill="x", padx=24, pady=(14, 8))
+    search_row = tk.Frame(mods, bg=BG)
+    search_row.pack(fill="x", padx=24)
+    source = tk.StringVar(value="modrinth")
+    for value, label in (("modrinth", "Modrinth"), ("curseforge", "CurseForge")):
+        tk.Radiobutton(search_row, text=label, value=value, variable=source, bg=BG, fg=TEXT,
+                       selectcolor=PANEL, activebackground=BG, activeforeground=TEXT,
+                       highlightthickness=0, font=font(13)).pack(side="left", padx=(0, 10))
+    query = make_entry(search_row)
+    query.pack(side="left", fill="x", expand=True, padx=(6, 10), ipady=5)
+    results_lb = make_listbox(mods, 8)
+    description = make_label(mods, size=12, color=MUTED, wraplength=W - 48)
+    install_row = tk.Frame(mods, bg=BG)
+    mods_msg = make_label(install_row, size=12, color=MUTED, wraplength=W - 220)
+    installed_lb = make_listbox(mods, 6)
+    installed_row = tk.Frame(mods, bg=BG)
+
+    def set_mods_msg(msg, error=False):
+        mods_msg.config(text=msg, fg=RED if error else MUTED)
+        write_log(msg)
+
+    def refresh_installed():
+        state["installed"] = list_installed(current_dir())
+        installed_lb.delete(0, "end")
+        for m in state["installed"]:
+            name = m["title"] if m["title"] == m["file"] else f"{m['title']}   ·   {m['file']}"
+            installed_lb.insert("end", name)
+
+    def mods_ready():
+        if not profile().get("use_fabric"):
+            set_mods_msg("Ten profil nie ma Fabrica, więc mody nie zadziałają. Włącz Fabric w Ustawieniach.", True)
+            return False
+        if source.get() == "curseforge" and not cfg.get("curseforge_api_key"):
+            set_mods_msg("CurseForge wymaga klucza API. Wpisz go w Ustawieniach.", True)
+            return False
+        return True
+
+    def do_search(_event=None):
+        if not mods_ready():
+            return
+        text, src, key = query.get().strip(), source.get(), cfg.get("curseforge_api_key", "")
+        wanted = profile()["game_version"]
+        set_mods_msg("Szukam…")
+
+        def job():
+            version = resolve_game_version(wanted)
+            hits = modrinth_search(text, version) if src == "modrinth" else curseforge_search(text, version, key)
+            return version, hits
+
+        def done(result):
+            version, hits = result
+            state["results"] = hits
+            results_lb.delete(0, "end")
+            for h in hits:
+                results_lb.insert("end", f"{h['title']}   ·   {format_count(h['downloads'])} pobrań")
+            description.config(text="")
+            set_mods_msg(f"Znaleziono {len(hits)} modów dla Minecraft {version}" if hits
+                         else f"Brak modów dla Minecraft {version} z Fabric")
+
+        background(job, done, set_mods_msg)
+
+    def selected_index(listbox, items):
+        sel = listbox.curselection()
+        if not sel or sel[0] >= len(items):
+            return None
+        return sel[0]
+
+    def on_result_select(_event=None):
+        i = selected_index(results_lb, state["results"])
+        if i is not None:
+            description.config(text=state["results"][i]["description"][:300])
+
+    def do_install():
+        i = selected_index(results_lb, state["results"])
+        if i is None:
+            set_mods_msg("Najpierw zaznacz mod na liście wyników.", True)
+            return
+        if not mods_ready():
+            return
+        hit, game_dir, key = state["results"][i], current_dir(), cfg.get("curseforge_api_key", "")
+        wanted = profile()["game_version"]
+        set_mods_msg(f"Instaluję: {hit['title']}…")
+
+        def job():
+            names = []
+            install_mod(hit, resolve_game_version(wanted), game_dir, key, names.append)
+            return names
+
+        def done(names):
+            refresh_installed()
+            set_mods_msg("Zainstalowano: " + ", ".join(names))
+
+        def failed(msg, error=True):
+            refresh_installed()  # czesc zaleznosci mogla sie juz pobrac
+            set_mods_msg(msg, error)
+
+        background(job, done, failed)
+
+    def do_remove():
+        i = selected_index(installed_lb, state["installed"])
+        if i is None:
+            set_mods_msg("Najpierw zaznacz mod na liście zainstalowanych.", True)
+            return
+        mod = state["installed"][i]
+        if not messagebox.askyesno(NAME, f"Usunąć plik {mod['file']} z tego profilu?"):
+            return
+        try:
+            remove_mod(current_dir(), mod["file"])
+            set_mods_msg(f"Usunięto: {mod['title']}")
+        except (OSError, LauncherError) as e:
+            set_mods_msg(f"Nie udało się usunąć: {e}", True)
+        refresh_installed()
+
+    make_button(search_row, "Szukaj", do_search, primary=True).pack(side="left")
+    query.bind("<Return>", do_search)
+    results_lb.pack(fill="x", padx=24, pady=(10, 4))
+    results_lb.bind("<<ListboxSelect>>", on_result_select)
+    description.pack(fill="x", padx=24)
+    install_row.pack(fill="x", padx=24, pady=(6, 6))
+    make_button(install_row, "Zainstaluj", do_install, primary=True).pack(side="left")
+    mods_msg.pack(side="left", padx=12)
+    make_label(mods, "Zainstalowane w tym profilu", size=13, bold=True).pack(fill="x", padx=24, pady=(8, 4))
+    installed_lb.pack(fill="x", padx=24)
+    installed_row.pack(fill="x", padx=24, pady=8)
+    make_button(installed_row, "Usuń", do_remove).pack(side="left")
+    make_button(installed_row, "Otwórz folder mods",
+                lambda: open_folder(current_dir() / "mods")).pack(side="left", padx=8)
+    make_button(installed_row, "Odśwież", refresh_installed).pack(side="left")
+
+    # ====================================================== widok USTAWIENIA
+    sett = tk.Frame(win, bg=BG)
+    sett.columnconfigure(1, weight=1)
+    make_label(sett, "Profil", size=15, bold=True).grid(row=0, column=0, columnspan=2, sticky="w", padx=24, pady=(14, 6))
+    profile_cb = ttk.Combobox(sett, state="readonly", font=font(13))
+    name_entry = make_entry(sett)
+    version_cb = ttk.Combobox(sett, values=["latest"], font=font(13))
+    fabric_var = tk.BooleanVar(value=True)
+    fabric_check = tk.Checkbutton(sett, text="Fabric (wymagany do modów)", variable=fabric_var, bg=BG, fg=TEXT,
+                                  selectcolor=PANEL, activebackground=BG, activeforeground=TEXT,
+                                  highlightthickness=0, font=font(13), anchor="w")
+    ram_entry, java_entry, cf_entry = make_entry(sett), make_entry(sett), make_entry(sett)
+    fields = (("Wybrany profil", profile_cb), ("Nazwa", name_entry),
+              ("Wersja gry („latest” = najnowsza)", version_cb), ("", fabric_check))
+    for i, (label, widget) in enumerate(fields, start=1):
+        make_label(sett, label, color=MUTED).grid(row=i, column=0, sticky="w", padx=(24, 12), pady=4)
+        widget.grid(row=i, column=1, sticky="we", padx=(0, 24), pady=4, ipady=3)
+    profile_buttons = tk.Frame(sett, bg=BG)
+    profile_buttons.grid(row=5, column=0, columnspan=2, sticky="w", padx=24, pady=(6, 10))
+    make_label(sett, "Launcher", size=15, bold=True).grid(row=6, column=0, columnspan=2, sticky="w", padx=24, pady=(10, 6))
+    fields2 = (("Pamięć RAM dla gry (MB)", ram_entry), ("Ścieżka do Javy (puste = automatycznie)", java_entry),
+               ("Klucz API CurseForge (opcjonalny)", cf_entry))
+    for i, (label, widget) in enumerate(fields2, start=7):
+        make_label(sett, label, color=MUTED).grid(row=i, column=0, sticky="w", padx=(24, 12), pady=4)
+        widget.grid(row=i, column=1, sticky="we", padx=(0, 24), pady=4, ipady=3)
+    launcher_buttons = tk.Frame(sett, bg=BG)
+    launcher_buttons.grid(row=10, column=0, columnspan=2, sticky="w", padx=24, pady=(6, 6))
+    sett_msg = make_label(sett, size=12, color=MUTED, wraplength=W - 48)
+    sett_msg.grid(row=11, column=0, columnspan=2, sticky="w", padx=24, pady=6)
+
+    def set_sett_msg(msg, error=False):
+        sett_msg.config(text=msg, fg=RED if error else GREEN)
+        write_log(msg)
+
+    def load_settings_fields():
+        ids = list(pdata["profiles"])
+        profile_cb.config(values=[pdata["profiles"][pid]["name"] for pid in ids])
+        profile_cb.current(ids.index(pdata["selected"]))
+        set_entry(name_entry, profile()["name"])
+        version_cb.set(profile()["game_version"])
+        fabric_var.set(bool(profile().get("use_fabric", True)))
+        set_entry(ram_entry, str(cfg.get("memory_mb", 4096)))
+        set_entry(java_entry, cfg.get("java_path", ""))
+        set_entry(cf_entry, cfg.get("curseforge_api_key", ""))
+
+    def on_profile_pick(_event=None):
+        ids = list(pdata["profiles"])
+        i = profile_cb.current()
+        if isinstance(i, int) and 0 <= i < len(ids):
+            select_profile(ids[i])
+
+    def save_profile():
+        name = name_entry.get().strip()
+        version = version_cb.get().strip() or "latest"
+        if not name:
+            return set_sett_msg("Nazwa profilu nie może być pusta.", True)
+        if not valid_game_version(version):
+            return set_sett_msg("Wersja gry musi mieć postać np. 26.3 albo „latest”.", True)
+        profile().update({"name": name[:40], "game_version": version, "use_fabric": bool(fabric_var.get())})
+        save_profiles(pdata)
+        load_settings_fields()
+        refresh_profile_labels()
+        set_sett_msg(f"Zapisano profil „{profile()['name']}”.")
+
+    def new_profile():
+        if state["busy"]:
+            return
+        name = f"Nowy profil {len(pdata['profiles'])}"
+        pid = new_profile_id(name, pdata["profiles"])
+        pdata["profiles"][pid] = {"name": name, "game_version": "latest", "use_fabric": True}
+        pdata["selected"] = pid
+        save_profiles(pdata)
+        load_settings_fields()
+        refresh_profile_labels()
+        set_sett_msg("Utworzono nowy profil. Zmień nazwę i wersję, a potem kliknij „Zapisz profil”.")
+
+    def delete_profile():
+        pid = pdata["selected"]
+        if state["busy"]:
+            return
+        if pid == "default":
+            return set_sett_msg("Profilu domyślnego nie można usunąć.", True)
+        folder = profile_dir(pid)
+        if not messagebox.askyesno(NAME, f"Usunąć profil „{profile()['name']}” z listy?\n\n"
+                                         f"Pliki (światy, mody) zostaną na dysku w:\n{folder}"):
+            return
+        del pdata["profiles"][pid]
+        pdata["selected"] = "default" if "default" in pdata["profiles"] else next(iter(pdata["profiles"]))
+        save_profiles(pdata)
+        load_settings_fields()
+        refresh_profile_labels()
+        set_sett_msg(f"Usunięto profil z listy. Jego pliki zostały w {folder}")
+
+    def save_settings():
+        try:
+            ram = int(ram_entry.get().strip())
+        except ValueError:
+            return set_sett_msg("Pamięć RAM musi być liczbą, np. 4096.", True)
+        if not 1024 <= ram <= 65536:
+            return set_sett_msg("Pamięć RAM musi być w zakresie 1024–65536 MB.", True)
+        cfg.update({"memory_mb": ram, "java_path": java_entry.get().strip(),
+                    "curseforge_api_key": cf_entry.get().strip()})
+        save_config(cfg)
+        set_sett_msg("Zapisano ustawienia launchera.")
+
+    profile_cb.bind("<<ComboboxSelected>>", on_profile_pick)
+    make_button(profile_buttons, "Zapisz profil", save_profile, primary=True).pack(side="left")
+    make_button(profile_buttons, "Nowy profil", new_profile).pack(side="left", padx=8)
+    make_button(profile_buttons, "Usuń profil", delete_profile).pack(side="left")
+    make_button(profile_buttons, "Otwórz folder profilu", lambda: open_folder(current_dir())).pack(side="left", padx=8)
+    make_button(launcher_buttons, "Zapisz ustawienia", save_settings, primary=True).pack(side="left")
+
+    # ============================================================== nawigacja
+    nav = {}
+    x = 24
+    for key, label in (("play", "GRAJ"), ("mods", "MODY"), ("settings", "USTAWIENIA")):
+        nav[key] = cv.create_text(x, 24, text=label, anchor="w", font=font(13, "bold"), fill=MUTED,
+                                  tags=("nav", "nav_" + key))
+        box = cv.bbox(nav[key])
+        x = (box[2] if box else x + 12 * len(label)) + 28
+
+    def show(view):
+        if state["busy"] and view != "play":
+            return  # w trakcie logowania/uruchamiania zostajemy na ekranie gry
+        state["view"] = view
+        for key, item in nav.items():
+            cv.itemconfig(item, fill="#ffffff" if key == view else "#9aa3c7")
+        mods.place_forget()
+        sett.place_forget()
+        if view == "mods":
+            refresh_profile_labels()
+            refresh_installed()
+            mods.place(x=0, y=TOP, width=W, height=H - TOP)
+        elif view == "settings":
+            load_settings_fields()
+            sett.place(x=0, y=TOP, width=W, height=H - TOP)
+
+    for key in nav:
+        cv.tag_bind("nav_" + key, "<Button-1>", lambda e, k=key: show(k))
+    cv.tag_bind("nav", "<Enter>", lambda e: cv.config(cursor="hand2"))
+    cv.tag_bind("nav", "<Leave>", lambda e: cv.config(cursor=""))
+
+    def profile_menu(event):
+        if state["busy"]:
+            return
+        menu = tk.Menu(win, tearoff=0, bg=PANEL, fg=TEXT, activebackground=SELECT, activeforeground=TEXT)
+        for pid, p in pdata["profiles"].items():
+            mark = "✓  " if pid == pdata["selected"] else "     "
+            menu.add_command(label=mark + p["name"], command=lambda pid=pid: select_profile(pid))
+        menu.add_separator()
+        menu.add_command(label="Zarządzaj profilami…", command=lambda: show("settings"))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    cv.tag_bind("profile", "<Button-1>", profile_menu)
+    cv.tag_bind("profile", "<Enter>", lambda e: cv.config(cursor="hand2"))
+    cv.tag_bind("profile", "<Leave>", lambda e: cv.config(cursor=""))
+
+    # ================================================== logowanie i start gry
     def set_button(text=None, enabled=None):
         if text is not None:
             cv.itemconfig(btn_label, text=text)
@@ -605,10 +1239,6 @@ def run_gui():
 
     def set_stage(msg, error=False):
         cv.itemconfig(stage, text=msg[:160], fill=RED if error else MUTED)
-
-    def write_log(msg):
-        logbox.insert("end", msg + "\n")
-        logbox.see("end")
 
     def log(msg):
         events.put(("stage", str(msg)))
@@ -631,28 +1261,30 @@ def run_gui():
         threading.Thread(target=run, daemon=True).start()
 
     def do_login():
-        def show(code, uri):
+        def show_code(code, uri):
             events.put(("code", code, uri))
             webbrowser.open(uri)
-        account = MicrosoftAuth(cfg["msa_client_id"]).login(show)
+        account = MicrosoftAuth(cfg["msa_client_id"]).login(show_code)
         state["account"] = account
         events.put(("account", account["name"]))
 
-    def do_play():
-        proc = prepare_and_launch(cfg, state["account"], log, progress)
-        events.put(("stage", "Gra uruchomiona"))
-        events.put(("ingame",))
-        for line in proc.stdout:
-            events.put(("gamelog", line.rstrip()))
-        events.put(("stage", f"Gra zakończona (kod {proc.wait()})"))
-
     def on_click(_event=None):
-        if state["busy"] or not state.get("btn_on", True):
+        if state["busy"] or not state.get("btn_on", True) or state["view"] != "play":
             return
-        if state["account"]:
-            worker(do_play, "URUCHAMIANIE…")
-        else:
-            worker(do_login, "LOGOWANIE…")
+        if not state["account"]:
+            return worker(do_login, "LOGOWANIE…")
+        p, game_dir, account = dict(profile()), current_dir(), state["account"]
+        launch_cfg = dict(cfg, game_version=p["game_version"], use_fabric=bool(p.get("use_fabric", True)))
+
+        def do_play():
+            proc = prepare_and_launch(launch_cfg, account, log, progress, game_dir)
+            events.put(("stage", "Gra uruchomiona"))
+            events.put(("ingame",))
+            for line in proc.stdout:
+                events.put(("gamelog", line.rstrip()))
+            events.put(("stage", f"Gra zakończona (kod {proc.wait()})"))
+
+        worker(do_play, "URUCHAMIANIE…")
 
     def on_logout(_event=None):
         if state["busy"] or not state["account"]:
@@ -678,14 +1310,15 @@ def run_gui():
     cv.tag_bind("logout", "<Button-1>", on_logout)
     cv.tag_bind("logout", "<Enter>", lambda e: cv.config(cursor="hand2"))
     cv.tag_bind("logout", "<Leave>", lambda e: cv.config(cursor=""))
-    win.bind("<Return>", on_click)
 
     def pump():
         try:
             while True:
                 ev = events.get_nowait()
                 kind = ev[0]
-                if kind == "stage":
+                if kind == "ui":
+                    ev[1]()
+                elif kind == "stage":
                     set_stage(ev[1])
                     write_log(ev[1])
                 elif kind == "gamelog":
@@ -721,8 +1354,11 @@ def run_gui():
             pass
         win.after(100, pump)
 
+    refresh_profile_labels()
+    show("play")
     write_log(f"Folder launchera: {ROOT}")
-    write_log(f"Mody wrzucaj do: {GAME_DIR / 'mods'}")
+    background(list_release_versions, lambda versions: version_cb.config(values=["latest"] + versions),
+               lambda msg, error=True: write_log(f"Nie udało się pobrać listy wersji: {msg}"))
     if AUTH_FILE.exists() and cfg["msa_client_id"]:
         worker(do_login, "LOGOWANIE…")  # ciche odswiezenie zapisanej sesji
     pump()

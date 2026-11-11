@@ -10,6 +10,8 @@ Zorza Client is a hobby launcher for **Minecraft: Java Edition** that installs F
 - Installs Fabric Loader from `meta.fabricmc.net`.
 - Signs in **only with a Microsoft account** (OAuth 2.0 device code flow → Xbox Live → XSTS → Minecraft Services).
 - Keeps its files in a separate folder (`.zorza`), so it does not touch the official launcher's installation.
+- Profiles: each profile has its own game folder (mods, worlds, options), game version and Fabric toggle.
+- Installs Fabric mods from **Modrinth** and **CurseForge** (CurseForge requires the user's own API key), including required dependencies. Mods whose authors disallow third-party distribution are not downloaded.
 
 ## What it does not do
 
@@ -46,6 +48,7 @@ Zorza Client to hobbystyczny launcher do **Minecraft: Java Edition**, który ins
 - Pobiera grę, biblioteki, zasoby i Javę **bezpośrednio z oficjalnych serwerów Mojangu** i sprawdza sumy kontrolne.
 - Loguje **wyłącznie kontem Microsoft**; nie obsługuje kont nonpremium ani trybu offline.
 - Nie rozpowszechnia plików gry i nie zawiera cheatów.
+- Profile z osobnymi folderami gry oraz instalowanie modów Fabric z Modrinth i CurseForge (CurseForge wymaga własnego klucza API).
 - Lokalnie zapisuje tylko token odświeżania Microsoft (`auth.json`), żeby nie trzeba było logować się za każdym razem.
 
 Uruchamianie: `python zorza_launcher.py` (wymaga Pythona 3.9+).
