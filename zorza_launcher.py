@@ -67,13 +67,23 @@ PROFILES_FILE, PROFILES_DIR = ROOT / "profiles.json", ROOT / "profiles"
 MODRINTH = "https://api.modrinth.com/v2"
 CURSEFORGE = "https://api.curseforge.com/v1"
 
+try:  # klucz CurseForge trzymany w osobnym pliku, ktory nie trafia do repozytorium (.gitignore)
+    from zorza_secrets import CURSEFORGE_API_KEY as BUILTIN_CURSEFORGE_KEY
+except ImportError:
+    BUILTIN_CURSEFORGE_KEY = ""
+
+
+def curseforge_key(cfg: dict) -> str:
+    """Wlasny klucz z ustawien ma pierwszenstwo przed wbudowanym."""
+    return (cfg.get("curseforge_api_key") or BUILTIN_CURSEFORGE_KEY or "").strip()
+
 DEFAULT_CONFIG = {
     "msa_client_id": "",      # ID aplikacji z Azure (wymaga zgody Mojangu na API)
     "game_version": "latest",  # "latest" albo np. "26.3"
     "use_fabric": True,
     "memory_mb": 4096,
     "java_path": "",          # puste = pobierz Jave od Mojangu
-    "curseforge_api_key": "",  # potrzebny tylko do modow z CurseForge
+    "curseforge_api_key": "",  # opcjonalny wlasny klucz; puste = klucz wbudowany
 }
 
 
@@ -1671,8 +1681,8 @@ def run_gui():
                 problem = "Ten profil został usunięty."
             elif not p.get("use_fabric", True):
                 problem = "Ten profil nie ma Fabrica. Włącz go w edycji profilu."
-            elif dl["source"] == "curseforge" and not cfg.get("curseforge_api_key"):
-                problem = "CurseForge wymaga klucza API. Wpisz go w Ustawieniach."
+            elif dl["source"] == "curseforge" and not curseforge_key(cfg):
+                problem = "Ta wersja nie ma wbudowanego klucza CurseForge. Wpisz własny w Ustawieniach."
             if problem:
                 dl["results"], dl["key"] = [], None
                 render()
@@ -1684,7 +1694,7 @@ def run_gui():
             """Bez wpisanego tekstu pokazuje najpopularniejsze mody; more=True doczytuje kolejna strone."""
             if not ready():
                 return
-            text, src, key = query.get().strip(), dl["source"], cfg.get("curseforge_api_key", "")
+            text, src, key = query.get().strip(), dl["source"], curseforge_key(cfg)
             sort = dict(SORTS).get(sort_cb.get(), "downloads") if src == "modrinth" else None
             if src == "modrinth" and not text and sort == "relevance":
                 sort = "downloads"  # bez zapytania "trafnosc" nie ma sensu
@@ -1750,7 +1760,7 @@ def run_gui():
                 return
             if is_active(pid):
                 return det_msg.config(text="Zamknij grę przed instalowaniem modów.", fg=RED)
-            wanted, key, game_dir = profile(pid)["game_version"], cfg.get("curseforge_api_key", ""), profile_dir(pid)
+            wanted, key, game_dir = profile(pid)["game_version"], curseforge_key(cfg), profile_dir(pid)
             install_btn.config(state="disabled")
             det_msg.config(text=f"Instaluję: {r['title']}…", fg=MUTED)
 
@@ -1801,7 +1811,9 @@ def run_gui():
         cf_e.insert(0, cfg.get("curseforge_api_key", ""))
         form_row(f, 1, "Pamięć RAM dla gry (MB)", ram_e)
         form_row(f, 2, "Ścieżka do Javy (puste = automatycznie)", java_e)
-        form_row(f, 3, "Klucz API CurseForge", cf_e)
+        form_row(f, 3, "Własny klucz API CurseForge", cf_e)
+        make_label(f, "Puste = klucz wbudowany w launcher" if BUILTIN_CURSEFORGE_KEY
+                   else "Ta wersja nie ma wbudowanego klucza", 12, MUTED).grid(row=6, column=1, sticky="w")
         msg = make_label(f, "", 12, GREEN)
         msg.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
