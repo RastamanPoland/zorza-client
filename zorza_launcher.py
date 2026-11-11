@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 NAME = "Zorza Client"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 UA = f"RastamanPoland/zorza-client/{VERSION} (github.com/RastamanPoland/zorza-client)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -343,6 +343,7 @@ class MicrosoftAuth:
                 "Zarejestruj aplikacje w Azure (konta osobiste, 'public client flows' wlaczone), "
                 "wpisz jej ID do configu i zglos ja Mojangowi do zatwierdzenia.")
         self.client_id = client_id
+        self.cancelled = threading.Event()
 
     def _msa_token(self, show_code):
         saved = json.loads(AUTH_FILE.read_text("utf-8")) if AUTH_FILE.exists() else {}
@@ -360,7 +361,8 @@ class MicrosoftAuth:
         deadline = time.time() + int(dev.get("expires_in", 900))
         interval = int(dev.get("interval", 5))
         while time.time() < deadline:
-            time.sleep(interval)
+            if self.cancelled.wait(interval):
+                raise LauncherError("Logowanie anulowane")
             code, tok = post_json_lenient(f"{MSA}/token", form=True, data={
                 "client_id": self.client_id, "device_code": dev["device_code"],
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code"})
@@ -445,6 +447,7 @@ def build_command(v, account, java, classpath, cfg, game_dir=None) -> list:
         return out
 
     cmd = [java, f"-Xmx{int(cfg['memory_mb'])}M"]
+    cmd += [a for a in str(cfg.get("jvm_args", "")).split() if a]
     cmd += expand(v["arguments"]["jvm"])
     cmd += [v["mainClass"]]
     cmd += expand(v["arguments"]["game"])
@@ -546,7 +549,7 @@ def profile_dir(profile_id: str) -> Path:
 def new_profile_id(name: str, existing) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "profil"
     pid, n = base, 2
-    while pid in existing or pid == "default":
+    while pid in existing or pid == "default" or (PROFILES_DIR / pid).exists():
         pid, n = f"{base}-{n}", n + 1
     return pid
 
@@ -578,23 +581,63 @@ def save_mods_index(game_dir: Path, index: dict) -> None:
     mods_index_file(game_dir).write_text(json.dumps(index, indent=2, ensure_ascii=False), "utf-8")
 
 
+def mod_base(name: str) -> str:
+    """'sodium.jar.disabled' -> 'sodium.jar' (wylaczone mody maja dopisek .disabled, jak w Prism)."""
+    return name[: -len(".disabled")] if name.endswith(".jar.disabled") else name
+
+
 def list_installed(game_dir: Path) -> list:
-    """Pliki .jar z folderu mods, z tytulami modow zainstalowanych przez launcher."""
+    """Pliki .jar i .jar.disabled z folderu mods, z tytulami modow zainstalowanych przez launcher."""
     index = load_mods_index(game_dir)
     mods_dir = game_dir / "mods"
-    files = sorted(p.name for p in mods_dir.glob("*.jar")) if mods_dir.is_dir() else []
-    return [{"file": f, "title": index.get(f, {}).get("title", f),
-             "source": index.get(f, {}).get("source", "ręcznie")} for f in files]
+    out = []
+    if mods_dir.is_dir():
+        for path in sorted(mods_dir.iterdir(), key=lambda x: x.name.lower()):
+            if not path.is_file() or not (path.name.endswith(".jar") or path.name.endswith(".jar.disabled")):
+                continue
+            base = mod_base(path.name)
+            info = index.get(base, {})
+            out.append({"file": path.name, "base": base, "enabled": path.name.endswith(".jar"),
+                        "title": info.get("title", base), "source": info.get("source", "ręcznie"),
+                        "id": info.get("id")})
+    return out
+
+
+def _mod_paths(game_dir: Path, filename: str):
+    base = safe_jar_name(mod_base(Path(str(filename).replace("\\", "/")).name))
+    mods_dir = game_dir / "mods"
+    return base, mods_dir / base, mods_dir / (base + ".disabled")
+
+
+def toggle_mod(game_dir: Path, filename: str) -> bool:
+    """Wlacza albo wylacza mod. Zwraca True, jesli mod jest teraz wlaczony."""
+    _, on, off = _mod_paths(game_dir, filename)
+    if on.exists():
+        os.replace(on, off)
+        return False
+    if off.exists():
+        os.replace(off, on)
+        return True
+    raise LauncherError(f"Nie znaleziono pliku {on.name}")
 
 
 def remove_mod(game_dir: Path, filename: str) -> None:
-    name = safe_jar_name(filename)
-    path = game_dir / "mods" / name
-    if path.exists():
-        path.unlink()
+    base, on, off = _mod_paths(game_dir, filename)
+    for path in (on, off):
+        if path.exists():
+            path.unlink()
     index = load_mods_index(game_dir)
-    if index.pop(name, None) is not None:
+    if index.pop(base, None) is not None:
         save_mods_index(game_dir, index)
+
+
+def copy_profile_files(src: Path, dst: Path) -> None:
+    if dst.exists():
+        raise LauncherError(f"Folder {dst} już istnieje")
+    if src.exists():
+        shutil.copytree(src, dst, ignore=shutil.ignore_patterns("logs", "crash-reports"))
+    else:
+        (dst / "mods").mkdir(parents=True)
 
 
 def _store_mod(game_dir, url, filename, sha1, size, source, project_id, title, version):
@@ -605,25 +648,29 @@ def _store_mod(game_dir, url, filename, sha1, size, source, project_id, title, v
     index = load_mods_index(game_dir)
     for old, info in list(index.items()):
         if info.get("source") == source and str(info.get("id")) == str(project_id) and old != name:
-            old_path = game_dir / "mods" / old
-            if old_path.exists():
-                old_path.unlink()
+            for old_path in (game_dir / "mods" / old, game_dir / "mods" / (old + ".disabled")):
+                if old_path.exists():
+                    old_path.unlink()
             del index[old]
+    disabled = game_dir / "mods" / (name + ".disabled")
+    if disabled.exists():
+        disabled.unlink()  # nowa wersja jest wlaczona, bez duplikatu
     download(url, game_dir / "mods" / name, sha1, size)
     index[name] = {"source": source, "id": str(project_id), "title": title, "version": version}
     save_mods_index(game_dir, index)
 
 
-def modrinth_search(query: str, game_version: str, limit: int = 30, offset: int = 0) -> list:
+def modrinth_search(query: str, game_version: str, limit: int = 30, offset: int = 0, sort: str = None) -> list:
     """Bez zapytania zwraca najpopularniejsze mody (sortowanie po liczbie pobran)."""
     facets = [["project_type:mod"], ["categories:fabric"], [f"versions:{game_version}"]]
     params = {"limit": limit, "offset": offset, "facets": json.dumps(facets),
-              "index": "relevance" if query else "downloads"}
+              "index": sort or ("relevance" if query else "downloads")}
     if query:
         params["query"] = query
     hits = get_json(f"{MODRINTH}/search?{urllib.parse.urlencode(params)}").get("hits", [])
     return [{"source": "modrinth", "id": h["project_id"], "title": h.get("title", h["project_id"]),
-             "description": h.get("description", ""), "downloads": int(h.get("downloads", 0))} for h in hits]
+             "description": h.get("description", ""), "downloads": int(h.get("downloads", 0)),
+             "author": h.get("author", "")} for h in hits]
 
 
 def modrinth_install(project_id, game_version, game_dir, log=print, title=None, _seen=None) -> None:
@@ -679,7 +726,8 @@ def curseforge_search(query: str, game_version: str, api_key: str, limit: int = 
         params.update({"sortField": 2, "sortOrder": "desc"})  # popularnosc
     data = curseforge_get(f"/mods/search?{urllib.parse.urlencode(params)}", api_key).get("data", [])
     return [{"source": "curseforge", "id": str(m["id"]), "title": m.get("name", str(m["id"])),
-             "description": m.get("summary", ""), "downloads": int(m.get("downloadCount", 0))} for m in data]
+             "description": m.get("summary", ""), "downloads": int(m.get("downloadCount", 0)),
+             "author": ((m.get("authors") or [{}])[0] or {}).get("name", "")} for m in data]
 
 
 def curseforge_install(mod_id, game_version, game_dir, api_key, log=print, title=None, _seen=None) -> None:
@@ -729,6 +777,31 @@ def format_count(n: int) -> str:
     return str(n)
 
 
+def plural_mods(n: int) -> str:
+    if n == 1:
+        return "1 mod"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} mody"
+    return f"{n} modów"
+
+
+def shorten(text: str, n: int) -> str:
+    text = str(text)
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def tile_color(key: str) -> str:
+    palette = ("#3ddc97", "#2bc4c9", "#8b5cf6", "#d16ba5", "#f2a65a", "#5b8def")
+    return palette[sum(map(ord, key)) % len(palette)]
+
+
+def launch_settings(cfg: dict, profile: dict) -> dict:
+    """Ustawienia globalne nadpisane ustawieniami profilu."""
+    return dict(cfg, game_version=profile["game_version"], use_fabric=bool(profile.get("use_fabric", True)),
+                memory_mb=int(profile.get("memory_mb") or cfg.get("memory_mb", 4096)),
+                jvm_args=profile.get("jvm_args", ""))
+
+
 # ---------------------------------------------------------------- interfejsy
 
 def run_cli():
@@ -747,8 +820,7 @@ def run_cli():
     pdata = load_profiles(cfg)
     p = pdata["profiles"][pdata["selected"]]
     print(f"Profil: {p['name']}")
-    launch_cfg = dict(cfg, game_version=p["game_version"], use_fabric=bool(p.get("use_fabric", True)))
-    proc = prepare_and_launch(launch_cfg, account, print, progress, profile_dir(pdata["selected"]))
+    proc = prepare_and_launch(launch_settings(cfg, p), account, print, progress, profile_dir(pdata["selected"]))
     for line in proc.stdout:
         print(line, end="")
     sys.exit(proc.wait())
@@ -803,9 +875,11 @@ def run_gui():
     import tkinter as tk
     from tkinter import messagebox, ttk
 
-    W, H, HEADER, TOP = 760, 640, 250, 48
-    BG, PANEL, TEXT, MUTED, LINE = "#0b0d1a", "#11142a", "#e9ecff", "#8088a8", "#1c2040"
-    GREEN, GREEN_HI, RED, OFF, SELECT = "#3ddc97", "#6ff0b6", "#ff7a90", "#2a2f4a", "#27407a"
+    BG, PANEL, PANEL2, TEXT, MUTED, LINE = "#0b0d1a", "#11142a", "#1a1f3d", "#e9ecff", "#8088a8", "#262b4d"
+    GREEN, GREEN_HI, RED, SELECT = "#3ddc97", "#6ff0b6", "#ff7a90", "#2b3f78"
+    SORTS = (("Popularność", "downloads"), ("Trafność", "relevance"),
+             ("Ostatnio zaktualizowane", "updated"), ("Najnowsze", "newest"))
+    PAGE, TILE_W, TILE_H = 30, 136, 140
 
     def font(px, *style):
         return ("Segoe UI", -px) + style  # ujemny rozmiar = piksele, uklad nie zalezy od DPI
@@ -813,607 +887,993 @@ def run_gui():
     cfg = load_config()
     pdata = load_profiles(cfg)
     events = queue.Queue()
-    state = {"account": None, "busy": False, "view": "play", "results": [], "installed": [],
-             "results_key": None, "results_req": 0, "results_end": False}
-    PAGE = 30
+    state = {"account": None, "login": None, "preparing": None, "running": None, "play_after": None,
+             "versions": ["latest"], "log": [], "console": None, "editors": {}, "downloaders": {}}
 
-    def profile():
-        return pdata["profiles"][pdata["selected"]]
+    root = tk.Tk()
+    root.title(f"{NAME} {VERSION}")
+    root.configure(bg=BG)
+    root.minsize(860, 540)
+    W, H = 1000, 640
+    root.geometry(f"{W}x{H}+{max(0, (root.winfo_screenwidth() - W) // 2)}"
+                  f"+{max(0, (root.winfo_screenheight() - H) // 3)}")
 
-    def current_dir():
-        return profile_dir(pdata["selected"])
-
-    win = tk.Tk()
-    win.title(f"{NAME} {VERSION}")
-    win.configure(bg=BG)
-    win.resizable(False, False)
-    win.geometry(f"{W}x{H}+{max(0, (win.winfo_screenwidth() - W) // 2)}+{max(0, (win.winfo_screenheight() - H) // 3)}")
-    cv = tk.Canvas(win, width=W, height=H, bg=BG, highlightthickness=0, bd=0)
-    cv.pack()
-
-    try:  # ciemne listy rozwijane
-        style = ttk.Style(win)
+    try:  # ciemny wyglad list rozwijanych i pasków przewijania
+        style = ttk.Style(root)
         style.theme_use("clam")
-        style.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=TEXT,
+        style.configure("TCombobox", fieldbackground=PANEL, background=PANEL2, foreground=TEXT,
                         arrowcolor=TEXT, bordercolor=LINE, lightcolor=PANEL, darkcolor=PANEL)
-        style.map("TCombobox", fieldbackground=[("readonly", PANEL)], foreground=[("readonly", TEXT)],
+        style.map("TCombobox", fieldbackground=[("readonly", PANEL), ("disabled", BG)],
+                  foreground=[("readonly", TEXT), ("disabled", MUTED)],
                   selectbackground=[("readonly", PANEL)], selectforeground=[("readonly", TEXT)])
+        style.configure("Vertical.TScrollbar", background=PANEL2, troughcolor=BG, bordercolor=BG,
+                        arrowcolor=MUTED, lightcolor=PANEL2, darkcolor=PANEL2)
         for key, value in (("background", PANEL), ("foreground", TEXT),
                            ("selectBackground", SELECT), ("selectForeground", TEXT)):
-            win.option_add(f"*TCombobox*Listbox.{key}", value)
+            root.option_add(f"*TCombobox*Listbox.{key}", value)
     except tk.TclError:
         pass
 
-    # ===================================================== widok GRAJ (canvas)
-    try:
-        rows = render_aurora(W, HEADER)
-        win.aurora = tk.PhotoImage(width=W, height=HEADER)  # referencja, zeby obraz nie zniknal
-        win.aurora.put(" ".join("{" + " ".join(r) + "}" for r in rows))
-        cv.create_image(0, 0, image=win.aurora, anchor="nw")
-    except tk.TclError:
-        pass  # bez obrazu zostaje samo ciemne tlo
-    cv.create_text(W // 2 + 2, 108, text="Z O R Z A", font=font(58, "bold"), fill="#05060f")
-    cv.create_text(W // 2, 106, text="Z O R Z A", font=font(58, "bold"), fill="#ffffff")
-    cv.create_text(W // 2, 158, text="C  L  I  E  N  T", font=font(15), fill="#b8f5da")
+    # ================================================================ pomocnicze
+    def ui(fn):
+        events.put(fn)  # wywolane w glownym watku okna
 
-    profile_item = cv.create_text(W // 2, 226, text="", font=font(14, "bold"), fill="#d7dcff", tags="profile")
-    status = cv.create_text(W // 2, 276, text="●  Niezalogowany", font=font(15), fill=MUTED)
-    code_text = cv.create_text(W // 2, 312, text="", font=("Consolas", -30, "bold"), fill=GREEN)
-    hint = cv.create_text(W // 2, 342, text="", font=font(12), fill=MUTED)
+    def background(job, done, fail):
+        """Uruchamia job() w osobnym watku; wynik albo blad wraca do okna."""
+        def run():
+            try:
+                result = job()
+            except LauncherError as e:
+                ui(lambda m=str(e): fail(m))
+            except Exception as e:  # siec, nieoczekiwane odpowiedzi API
+                ui(lambda m=f"{type(e).__name__}: {e}": fail(m))
+            else:
+                ui(lambda: done(result))
+        threading.Thread(target=run, daemon=True).start()
 
-    BX, BY, BW, BH = W // 2, 392, 300, 58
-    btn_shape = cv.create_polygon(round_points(BX - BW / 2, BY - BH / 2, BX + BW / 2, BY + BH / 2, 16),
-                                  smooth=True, fill=GREEN, outline="", tags="btn")
-    btn_label = cv.create_text(BX, BY, text="ZALOGUJ PRZEZ MICROSOFT", font=font(17, "bold"),
-                               fill="#06281b", tags="btn")
-    logout = cv.create_text(W // 2, 438, text="", font=font(12, "underline"), fill=MUTED, tags="logout")
+    def alive(win):
+        try:
+            return bool(win.winfo_exists())
+        except tk.TclError:
+            return False
 
-    PX0, PX1, PY = 120, W - 120, 470
-    cv.create_polygon(round_points(PX0, PY - 3, PX1, PY + 3, 3), smooth=True, fill=OFF, outline="")
-    bar = cv.create_rectangle(PX0, PY - 3, PX0, PY + 3, fill=GREEN, outline="")
-    stage = cv.create_text(W // 2, 490, text="", font=font(12), fill=MUTED, width=W - 160)
-
-    logbox = tk.Text(win, bg=PANEL, fg="#aab2d5", relief="flat", bd=0, padx=10, pady=8, wrap="none",
-                     font=("Consolas", -12), insertbackground="#aab2d5", highlightthickness=1,
-                     highlightbackground=LINE, highlightcolor=LINE)
-    cv.create_window(20, 512, window=logbox, anchor="nw", width=W - 40, height=96)
-    footer = cv.create_text(20, H - 14, anchor="w", font=font(11), fill="#565d80", text="")
-    cv.create_text(W - 20, H - 14, anchor="e", font=font(11), fill="#565d80", text=f"v{VERSION}")
-
-    # ============================================================ pomocnicze
-    def make_button(parent, text, command, primary=False):
+    def make_button(parent, text, command, kind="normal"):
+        bg, fg, active = {"normal": (PANEL2, TEXT, SELECT), "primary": (GREEN, "#06281b", GREEN_HI),
+                          "danger": (PANEL2, RED, "#3a2134")}[kind]
         return tk.Button(parent, text=text, command=command, relief="flat", bd=0, padx=14, pady=6,
-                         cursor="hand2", font=font(13, "bold") if primary else font(13),
-                         bg=GREEN if primary else LINE, fg="#06281b" if primary else TEXT,
-                         activebackground=GREEN_HI if primary else SELECT,
-                         activeforeground="#06281b" if primary else TEXT)
+                         cursor="hand2", font=font(13, "bold") if kind == "primary" else font(13),
+                         bg=bg, fg=fg, activebackground=active, activeforeground=fg,
+                         disabledforeground="#59607f", highlightthickness=0)
 
     def make_entry(parent, **kw):
         return tk.Entry(parent, bg=PANEL, fg=TEXT, insertbackground=TEXT, relief="flat", font=font(13),
                         highlightthickness=1, highlightbackground=LINE, highlightcolor=GREEN, **kw)
 
-    def make_listbox(parent, height):
+    def make_label(parent, text="", size=13, color=TEXT, bold=False, bg=BG, anchor="w", **kw):
+        return tk.Label(parent, text=text, bg=bg, fg=color, anchor=anchor, justify="left",
+                        font=font(size, "bold") if bold else font(size), **kw)
+
+    def make_listbox(parent, height=10):
         return tk.Listbox(parent, height=height, bg=PANEL, fg=TEXT, selectbackground=SELECT,
                           selectforeground=TEXT, relief="flat", bd=0, highlightthickness=1,
                           highlightbackground=LINE, highlightcolor=LINE, activestyle="none",
                           font=font(13), exportselection=False)
 
-    def make_label(parent, text="", size=13, color=TEXT, bold=False, **kw):
-        return tk.Label(parent, text=text, bg=BG, fg=color, anchor="w", justify="left",
-                        font=font(size, "bold") if bold else font(size), **kw)
+    def make_combobox(parent, values, readonly=False):
+        return ttk.Combobox(parent, values=list(values), font=font(13), state="readonly" if readonly else "normal")
 
-    def set_entry(entry, value):
-        entry.delete(0, "end")
-        entry.insert(0, value)
+    def make_check(parent, text, var, bg=BG):
+        return tk.Checkbutton(parent, text=text, variable=var, bg=bg, fg=TEXT, selectcolor=PANEL,
+                              activebackground=bg, activeforeground=TEXT, highlightthickness=0,
+                              font=font(13), anchor="w")
+
+    def make_menu():
+        return tk.Menu(root, tearoff=0, bg=PANEL, fg=TEXT, activebackground=SELECT,
+                       activeforeground=TEXT, disabledforeground=MUTED, bd=0)
+
+    def make_dialog(title, w, h, resizable=False):
+        d = tk.Toplevel(root)
+        d.title(title)
+        d.configure(bg=BG)
+        d.transient(root)
+        x = root.winfo_rootx() + max(0, (root.winfo_width() - w) // 2)
+        y = root.winfo_rooty() + max(0, (root.winfo_height() - h) // 3)
+        d.geometry(f"{w}x{h}+{x}+{y}")
+        d.resizable(resizable, resizable)
+        return d
+
+    def form_row(parent, row, label, widget):
+        make_label(parent, label, 13, MUTED).grid(row=row, column=0, sticky="w", padx=(0, 14), pady=5)
+        widget.grid(row=row, column=1, sticky="we", pady=5, ipady=3)
+
+    def popup(menu, widget):
+        menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
+
+    def copy(text):
+        root.clipboard_clear()
+        root.clipboard_append(text)
+
+    def profile(pid=None):
+        return pdata["profiles"][pid or pdata["selected"]]
+
+    def version_label(p):
+        version = "najnowsza" if p["game_version"] == "latest" else p["game_version"]
+        return f"Minecraft {version}" + (" · Fabric" if p.get("use_fabric", True) else "")
+
+    def is_active(pid):
+        return state["preparing"] == pid or bool(state["running"] and state["running"]["pid"] == pid)
 
     def write_log(msg):
-        logbox.insert("end", str(msg) + "\n")
-        logbox.see("end")
+        state["log"].append(str(msg))
+        del state["log"][:-5000]
+        console = state["console"]
+        if console and alive(console["win"]):
+            console["text"].insert("end", str(msg) + "\n")
+            console["text"].see("end")
 
-    def background(job, done, on_error):
-        """Uruchamia job() w watku; wynik lub blad wraca do okna przez kolejke."""
-        def run():
-            try:
-                result = job()
-            except LauncherError as e:
-                events.put(("ui", lambda m=str(e): on_error(m, True)))
-            except Exception as e:  # siec, nieoczekiwane odpowiedzi API
-                events.put(("ui", lambda m=f"{type(e).__name__}: {e}": on_error(m, True)))
-            else:
-                events.put(("ui", lambda: done(result)))
-        threading.Thread(target=run, daemon=True).start()
+    # ======================================================= okno: baner i pasek
+    banner = tk.Canvas(root, height=64, bg=BG, highlightthickness=0, bd=0)
+    banner.pack(fill="x")
+    try:
+        rows = render_aurora(1400, 64)
+        root.aurora = tk.PhotoImage(width=1400, height=64)  # referencja, zeby obraz nie zniknal
+        root.aurora.put(" ".join("{" + " ".join(r) + "}" for r in rows))
+        banner.create_image(0, 0, image=root.aurora, anchor="nw")
+    except tk.TclError:
+        pass
+    logo = banner.create_text(24, 32, anchor="w", text="ZORZA", font=font(28, "bold"), fill="#ffffff")
+    box = banner.bbox(logo)
+    banner.create_text((box[2] if box else 130) + 10, 36, anchor="w", text="CLIENT", font=font(12), fill="#b8f5da")
 
-    def profile_summary():
-        p = profile()
-        version = "najnowsza" if p["game_version"] == "latest" else p["game_version"]
-        return f"Minecraft {version}" + (" + Fabric" if p.get("use_fabric") else " (bez modów)")
+    toolbar = tk.Frame(root, bg=PANEL)
+    toolbar.pack(fill="x")
+    make_button(toolbar, "＋  Dodaj profil", lambda: add_profile_dialog()).pack(side="left", padx=(10, 4), pady=6)
+    folders_btn = make_button(toolbar, "Foldery  ▾", lambda: popup(folders_menu(), folders_btn))
+    folders_btn.pack(side="left", padx=4)
+    make_button(toolbar, "Ustawienia", lambda: settings_dialog()).pack(side="left", padx=4)
+    make_button(toolbar, "Konsola", lambda: open_console()).pack(side="left", padx=4)
+    account_btn = make_button(toolbar, "Zaloguj się  ▾", lambda: popup(account_menu(), account_btn))
+    account_btn.pack(side="right", padx=10)
 
-    def refresh_profile_labels():
-        cv.itemconfig(profile_item, text=f"Profil: {profile()['name']}  ▾")
-        cv.itemconfig(footer, text=profile_summary())
-        mods_title.config(text=f"Mody  ·  {profile()['name']}  ·  {profile_summary()}")
+    statusbar = tk.Frame(root, bg=PANEL)
+    statusbar.pack(side="bottom", fill="x")
+    status_lbl = make_label(statusbar, "Gotowe", 12, MUTED, bg=PANEL)
+    status_lbl.pack(side="left", padx=12, pady=5)
+    prog = tk.Canvas(statusbar, width=220, height=6, bg=LINE, highlightthickness=0, bd=0)
+    prog.pack(side="right", padx=12)
+    prog_bar = prog.create_rectangle(0, 0, 0, 6, fill=GREEN, outline="")
+
+    body = tk.Frame(root, bg=BG)
+    body.pack(fill="both", expand=True)
+    side = tk.Frame(body, bg=PANEL, width=250)
+    side.pack(side="right", fill="y")
+    side.pack_propagate(False)
+    grid = tk.Canvas(body, bg=BG, highlightthickness=0, bd=0)
+    grid_scroll = ttk.Scrollbar(body, orient="vertical", command=grid.yview)
+    grid.configure(yscrollcommand=grid_scroll.set)
+    grid_scroll.pack(side="right", fill="y")
+    grid.pack(side="left", fill="both", expand=True)
+
+    def set_status(msg, error=False):
+        msg = str(msg)
+        status_lbl.config(text=shorten(msg.splitlines()[0] if msg else "", 120), fg=RED if error else MUTED)
+        write_log(("BŁĄD: " if error else "") + msg)
+
+    def set_progress(frac):
+        prog.coords(prog_bar, 0, 0, 220 * max(0.0, min(1.0, frac)), 6)
+
+    # ============================================================ kafelki profili
+    def draw_tiles(_event=None):
+        grid.delete("all")
+        width = max(grid.winfo_width(), TILE_W + 32)
+        cols = max(1, (width - 32) // TILE_W)
+        for i, (pid, p) in enumerate(pdata["profiles"].items()):
+            r, c = divmod(i, cols)
+            x0, y0 = 16 + c * TILE_W, 16 + r * TILE_H
+            cx, tag = x0 + TILE_W // 2, "tile_" + pid
+            if pid == pdata["selected"]:
+                grid.create_polygon(round_points(x0 + 4, y0 + 2, x0 + TILE_W - 4, y0 + TILE_H - 6, 14),
+                                    smooth=True, fill=SELECT, outline="", tags=(tag,))
+            grid.create_polygon(round_points(cx - 32, y0 + 14, cx + 32, y0 + 78, 16), smooth=True,
+                                fill=tile_color(pid), outline="", tags=(tag,))
+            grid.create_text(cx, y0 + 46, text=(p["name"][:1] or "?").upper(), font=font(30, "bold"),
+                             fill=BG, tags=(tag,))
+            grid.create_text(cx, y0 + 96, text=shorten(p["name"], 16), font=font(13, "bold"), fill=TEXT,
+                             tags=(tag,))
+            running = is_active(pid)
+            sub = ("▶ w grze" if state["running"] else "uruchamianie…") if running else version_label(p).replace("Minecraft ", "")
+            grid.create_text(cx, y0 + 116, text=shorten(sub, 20), font=font(11), fill=GREEN if running else MUTED,
+                             tags=(tag,))
+            grid.tag_bind(tag, "<Button-1>", lambda e, pid=pid: select_profile(pid))
+            grid.tag_bind(tag, "<Double-Button-1>", lambda e, pid=pid: (select_profile(pid), play(pid)))
+            grid.tag_bind(tag, "<Button-3>", lambda e, pid=pid: (select_profile(pid), context_menu(e)))
+        rows_count = (len(pdata["profiles"]) + cols - 1) // cols
+        grid.configure(scrollregion=(0, 0, width, 32 + rows_count * TILE_H))
+
+    grid.bind("<Configure>", draw_tiles)
+    grid.bind("<MouseWheel>", lambda e: grid.yview_scroll(int(-e.delta / 120), "units"))
+
+    # ================================================================ panel boczny
+    side_icon = tk.Canvas(side, width=84, height=84, bg=PANEL, highlightthickness=0, bd=0)
+    side_icon.pack(pady=(22, 8))
+    side_name = make_label(side, "", 16, TEXT, bold=True, bg=PANEL, anchor="center")
+    side_name.pack(fill="x", padx=12)
+    side_ver = make_label(side, "", 12, MUTED, bg=PANEL, anchor="center")
+    side_ver.pack(fill="x", padx=12)
+    side_mods = make_label(side, "", 12, MUTED, bg=PANEL, anchor="center")
+    side_mods.pack(fill="x", padx=12, pady=(0, 14))
+    play_btn = make_button(side, "▶  Graj", lambda: play(), "primary")
+    play_btn.pack(fill="x", padx=18, pady=(0, 6), ipady=4)
+    stop_btn = make_button(side, "■  Zatrzymaj", lambda: stop_game(), "danger")
+    stop_btn.pack(fill="x", padx=18, pady=(0, 14))
+    for text, command in (("Edytuj profil…", lambda: edit_profile()),
+                          ("Pobierz mody…", lambda: open_downloader()),
+                          ("Folder profilu", lambda: open_folder(profile_dir(pdata["selected"]))),
+                          ("Kopiuj profil", lambda: copy_profile())):
+        make_button(side, text, command).pack(fill="x", padx=18, pady=3)
+    delete_btn = make_button(side, "Usuń profil", lambda: delete_profile(), "danger")
+    delete_btn.pack(fill="x", padx=18, pady=3)
+
+    def refresh_side():
+        pid, p = pdata["selected"], profile()
+        side_icon.delete("all")
+        side_icon.create_polygon(round_points(6, 6, 78, 78, 18), smooth=True, fill=tile_color(pid), outline="")
+        side_icon.create_text(42, 42, text=(p["name"][:1] or "?").upper(), font=font(36, "bold"), fill=BG)
+        side_name.config(text=shorten(p["name"], 22))
+        side_ver.config(text=version_label(p))
+        side_mods.config(text=plural_mods(len(list_installed(profile_dir(pid)))) if p.get("use_fabric", True)
+                         else "bez modów")
+        busy = state["preparing"] is not None or state["running"] is not None
+        play_btn.config(state="disabled" if busy else "normal",
+                        text="Uruchamianie…" if state["preparing"] else ("▶  W grze" if state["running"] else "▶  Graj"))
+        stop_btn.config(state="normal" if state["running"] and state["running"]["pid"] == pid else "disabled")
+        delete_btn.config(state="disabled" if pid == "default" or is_active(pid) else "normal")
+
+    def refresh_account():
+        if state["login"]:
+            text = "Logowanie…"
+        elif state["account"]:
+            text = "●  " + state["account"]["name"]
+        else:
+            text = "Zaloguj się"
+        account_btn.config(text=text + "  ▾")
+
+    def refresh_all():
+        draw_tiles()
+        refresh_side()
+        refresh_account()
 
     def select_profile(pid):
-        if state["busy"] or pid not in pdata["profiles"]:
-            return
-        pdata["selected"] = pid
-        save_profiles(pdata)
-        refresh_profile_labels()
-        if state["view"] == "mods":
-            refresh_installed()
-            load_results()
-        elif state["view"] == "settings":
-            load_settings_fields()
+        if pid in pdata["profiles"] and pid != pdata["selected"]:
+            pdata["selected"] = pid
+            save_profiles(pdata)
+            refresh_all()
 
-    # ============================================================ widok MODY
-    mods = tk.Frame(win, bg=BG)
-    mods_title = make_label(mods, size=15, bold=True)
-    mods_title.pack(fill="x", padx=24, pady=(14, 8))
-    search_row = tk.Frame(mods, bg=BG)
-    search_row.pack(fill="x", padx=24)
-    source = tk.StringVar(value="modrinth")
-    for value, label in (("modrinth", "Modrinth"), ("curseforge", "CurseForge")):
-        tk.Radiobutton(search_row, text=label, value=value, variable=source, bg=BG, fg=TEXT,
-                       selectcolor=PANEL, activebackground=BG, activeforeground=TEXT, highlightthickness=0,
-                       font=font(13), command=lambda: load_results()).pack(side="left", padx=(0, 10))
-    query = make_entry(search_row)
-    query.pack(side="left", fill="x", expand=True, padx=(6, 10), ipady=5)
-    results_lb = make_listbox(mods, 8)
-    description = make_label(mods, size=12, color=MUTED, wraplength=W - 48)
-    install_row = tk.Frame(mods, bg=BG)
-    mods_msg = make_label(install_row, size=12, color=MUTED, wraplength=W - 330)
-    installed_lb = make_listbox(mods, 6)
-    installed_row = tk.Frame(mods, bg=BG)
-
-    def set_mods_msg(msg, error=False):
-        mods_msg.config(text=msg, fg=RED if error else MUTED)
-        write_log(msg)
-
-    def refresh_installed():
-        state["installed"] = list_installed(current_dir())
-        installed_lb.delete(0, "end")
-        for m in state["installed"]:
-            name = m["title"] if m["title"] == m["file"] else f"{m['title']}   ·   {m['file']}"
-            installed_lb.insert("end", name)
-
-    def mods_ready():
-        if not profile().get("use_fabric"):
-            set_mods_msg("Ten profil nie ma Fabrica, więc mody nie zadziałają. Włącz Fabric w Ustawieniach.", True)
-            return False
-        if source.get() == "curseforge" and not cfg.get("curseforge_api_key"):
-            set_mods_msg("CurseForge wymaga klucza API. Wpisz go w Ustawieniach.", True)
-            return False
-        return True
-
-    def installed_keys():
-        return {(i.get("source"), str(i.get("id"))) for i in load_mods_index(current_dir()).values()}
-
-    def render_results():
-        have = installed_keys()
-        results_lb.delete(0, "end")
-        for h in state["results"]:
-            mark = "✓  " if (h["source"], str(h["id"])) in have else "     "
-            results_lb.insert("end", f"{mark}{h['title']}   ·   {format_count(h['downloads'])} pobrań")
-
-    def load_results(more=False, force=False):
-        """Bez wpisanego tekstu pokazuje najpopularniejsze mody; more=True doczytuje kolejna strone."""
-        if not mods_ready():
-            return
-        text, src, key = query.get().strip(), source.get(), cfg.get("curseforge_api_key", "")
-        wanted = profile()["game_version"]
-        request_key = (src, pdata["selected"], wanted, text)
-        if more and (state["results_key"] != request_key or state["results_end"]):
-            return
-        if not more and not force and request_key == state["results_key"] and state["results"]:
-            return render_results()  # ta sama lista jest juz wczytana
-        offset = len(state["results"]) if more else 0
-        state["results_req"] += 1
-        req = state["results_req"]
-        set_mods_msg("Wczytuję kolejne…" if more else ("Szukam…" if text else "Wczytuję najpopularniejsze mody…"))
-
-        def job():
-            version = resolve_game_version(wanted)
-            if src == "modrinth":
-                hits = modrinth_search(text, version, PAGE, offset)
-            else:
-                hits = curseforge_search(text, version, key, PAGE, offset)
-            return version, hits
-
-        def done(result):
-            if req != state["results_req"]:
-                return  # w miedzyczasie zlecono nowsze wyszukiwanie
-            version, hits = result
-            if more:
-                seen = {(h["source"], str(h["id"])) for h in state["results"]}
-                hits = [h for h in hits if (h["source"], str(h["id"])) not in seen]
-                state["results"] += hits
-            else:
-                state["results"] = hits
-                description.config(text="")
-            state["results_key"], state["results_end"] = request_key, len(hits) < PAGE
-            render_results()
-            where = "Modrinth" if src == "modrinth" else "CurseForge"
-            if not state["results"]:
-                set_mods_msg(f"Brak modów dla Minecraft {version} z Fabric")
-            elif text:
-                set_mods_msg(f"{where}: {len(state['results'])} wyników dla „{text}” (Minecraft {version})")
-            else:
-                set_mods_msg(f"{where}: najpopularniejsze mody dla Minecraft {version} ({len(state['results'])})")
-
-        def failed(msg, error=True):
-            if req == state["results_req"]:
-                set_mods_msg(msg, error)
-
-        background(job, done, failed)
-
-    def do_search(_event=None):
-        load_results(force=True)
-
-    def selected_index(listbox, items):
-        sel = listbox.curselection()
-        if not sel or sel[0] >= len(items):
-            return None
-        return sel[0]
-
-    def on_result_select(_event=None):
-        i = selected_index(results_lb, state["results"])
-        if i is not None:
-            description.config(text=state["results"][i]["description"][:300])
-
-    def do_install():
-        i = selected_index(results_lb, state["results"])
-        if i is None:
-            set_mods_msg("Najpierw zaznacz mod na liście wyników.", True)
-            return
-        if not mods_ready():
-            return
-        hit, game_dir, key = state["results"][i], current_dir(), cfg.get("curseforge_api_key", "")
-        wanted = profile()["game_version"]
-        set_mods_msg(f"Instaluję: {hit['title']}…")
-
-        def job():
-            names = []
-            install_mod(hit, resolve_game_version(wanted), game_dir, key, names.append)
-            return names
-
-        def done(names):
-            refresh_installed()
-            render_results()
-            set_mods_msg("Zainstalowano: " + ", ".join(names))
-
-        def failed(msg, error=True):
-            refresh_installed()  # czesc zaleznosci mogla sie juz pobrac
-            render_results()
-            set_mods_msg(msg, error)
-
-        background(job, done, failed)
-
-    def do_remove():
-        i = selected_index(installed_lb, state["installed"])
-        if i is None:
-            set_mods_msg("Najpierw zaznacz mod na liście zainstalowanych.", True)
-            return
-        mod = state["installed"][i]
-        if not messagebox.askyesno(NAME, f"Usunąć plik {mod['file']} z tego profilu?"):
-            return
-        try:
-            remove_mod(current_dir(), mod["file"])
-            set_mods_msg(f"Usunięto: {mod['title']}")
-        except (OSError, LauncherError) as e:
-            set_mods_msg(f"Nie udało się usunąć: {e}", True)
-        refresh_installed()
-        render_results()
-
-    make_button(search_row, "Szukaj", do_search, primary=True).pack(side="left")
-    query.bind("<Return>", do_search)
-    results_lb.pack(fill="x", padx=24, pady=(10, 4))
-    results_lb.bind("<<ListboxSelect>>", on_result_select)
-    description.pack(fill="x", padx=24)
-    install_row.pack(fill="x", padx=24, pady=(6, 6))
-    make_button(install_row, "Zainstaluj", do_install, primary=True).pack(side="left")
-    make_button(install_row, "Pokaż więcej", lambda: load_results(more=True)).pack(side="left", padx=(8, 0))
-    mods_msg.pack(side="left", padx=12)
-    make_label(mods, "Zainstalowane w tym profilu", size=13, bold=True).pack(fill="x", padx=24, pady=(8, 4))
-    installed_lb.pack(fill="x", padx=24)
-    installed_row.pack(fill="x", padx=24, pady=8)
-    make_button(installed_row, "Usuń", do_remove).pack(side="left")
-    make_button(installed_row, "Otwórz folder mods",
-                lambda: open_folder(current_dir() / "mods")).pack(side="left", padx=8)
-    make_button(installed_row, "Odśwież", lambda: (refresh_installed(), render_results())).pack(side="left")
-
-    # ====================================================== widok USTAWIENIA
-    sett = tk.Frame(win, bg=BG)
-    sett.columnconfigure(1, weight=1)
-    make_label(sett, "Profil", size=15, bold=True).grid(row=0, column=0, columnspan=2, sticky="w", padx=24, pady=(14, 6))
-    profile_cb = ttk.Combobox(sett, state="readonly", font=font(13))
-    name_entry = make_entry(sett)
-    version_cb = ttk.Combobox(sett, values=["latest"], font=font(13))
-    fabric_var = tk.BooleanVar(value=True)
-    fabric_check = tk.Checkbutton(sett, text="Fabric (wymagany do modów)", variable=fabric_var, bg=BG, fg=TEXT,
-                                  selectcolor=PANEL, activebackground=BG, activeforeground=TEXT,
-                                  highlightthickness=0, font=font(13), anchor="w")
-    ram_entry, java_entry, cf_entry = make_entry(sett), make_entry(sett), make_entry(sett)
-    fields = (("Wybrany profil", profile_cb), ("Nazwa", name_entry),
-              ("Wersja gry („latest” = najnowsza)", version_cb), ("", fabric_check))
-    for i, (label, widget) in enumerate(fields, start=1):
-        make_label(sett, label, color=MUTED).grid(row=i, column=0, sticky="w", padx=(24, 12), pady=4)
-        widget.grid(row=i, column=1, sticky="we", padx=(0, 24), pady=4, ipady=3)
-    profile_buttons = tk.Frame(sett, bg=BG)
-    profile_buttons.grid(row=5, column=0, columnspan=2, sticky="w", padx=24, pady=(6, 10))
-    make_label(sett, "Launcher", size=15, bold=True).grid(row=6, column=0, columnspan=2, sticky="w", padx=24, pady=(10, 6))
-    fields2 = (("Pamięć RAM dla gry (MB)", ram_entry), ("Ścieżka do Javy (puste = automatycznie)", java_entry),
-               ("Klucz API CurseForge (opcjonalny)", cf_entry))
-    for i, (label, widget) in enumerate(fields2, start=7):
-        make_label(sett, label, color=MUTED).grid(row=i, column=0, sticky="w", padx=(24, 12), pady=4)
-        widget.grid(row=i, column=1, sticky="we", padx=(0, 24), pady=4, ipady=3)
-    launcher_buttons = tk.Frame(sett, bg=BG)
-    launcher_buttons.grid(row=10, column=0, columnspan=2, sticky="w", padx=24, pady=(6, 6))
-    sett_msg = make_label(sett, size=12, color=MUTED, wraplength=W - 48)
-    sett_msg.grid(row=11, column=0, columnspan=2, sticky="w", padx=24, pady=6)
-
-    def set_sett_msg(msg, error=False):
-        sett_msg.config(text=msg, fg=RED if error else GREEN)
-        write_log(msg)
-
-    def load_settings_fields():
-        ids = list(pdata["profiles"])
-        profile_cb.config(values=[pdata["profiles"][pid]["name"] for pid in ids])
-        profile_cb.current(ids.index(pdata["selected"]))
-        set_entry(name_entry, profile()["name"])
-        version_cb.set(profile()["game_version"])
-        fabric_var.set(bool(profile().get("use_fabric", True)))
-        set_entry(ram_entry, str(cfg.get("memory_mb", 4096)))
-        set_entry(java_entry, cfg.get("java_path", ""))
-        set_entry(cf_entry, cfg.get("curseforge_api_key", ""))
-
-    def on_profile_pick(_event=None):
-        ids = list(pdata["profiles"])
-        i = profile_cb.current()
-        if isinstance(i, int) and 0 <= i < len(ids):
-            select_profile(ids[i])
-
-    def save_profile():
-        name = name_entry.get().strip()
-        version = version_cb.get().strip() or "latest"
-        if not name:
-            return set_sett_msg("Nazwa profilu nie może być pusta.", True)
-        if not valid_game_version(version):
-            return set_sett_msg("Wersja gry musi mieć postać np. 26.3 albo „latest”.", True)
-        profile().update({"name": name[:40], "game_version": version, "use_fabric": bool(fabric_var.get())})
-        save_profiles(pdata)
-        load_settings_fields()
-        refresh_profile_labels()
-        set_sett_msg(f"Zapisano profil „{profile()['name']}”.")
-
-    def new_profile():
-        if state["busy"]:
-            return
-        name = f"Nowy profil {len(pdata['profiles'])}"
-        pid = new_profile_id(name, pdata["profiles"])
-        pdata["profiles"][pid] = {"name": name, "game_version": "latest", "use_fabric": True}
-        pdata["selected"] = pid
-        save_profiles(pdata)
-        load_settings_fields()
-        refresh_profile_labels()
-        set_sett_msg("Utworzono nowy profil. Zmień nazwę i wersję, a potem kliknij „Zapisz profil”.")
-
-    def delete_profile():
+    def context_menu(event):
         pid = pdata["selected"]
-        if state["busy"]:
-            return
-        if pid == "default":
-            return set_sett_msg("Profilu domyślnego nie można usunąć.", True)
-        folder = profile_dir(pid)
-        if not messagebox.askyesno(NAME, f"Usunąć profil „{profile()['name']}” z listy?\n\n"
-                                         f"Pliki (światy, mody) zostaną na dysku w:\n{folder}"):
-            return
-        del pdata["profiles"][pid]
-        pdata["selected"] = "default" if "default" in pdata["profiles"] else next(iter(pdata["profiles"]))
-        save_profiles(pdata)
-        load_settings_fields()
-        refresh_profile_labels()
-        set_sett_msg(f"Usunięto profil z listy. Jego pliki zostały w {folder}")
-
-    def save_settings():
-        try:
-            ram = int(ram_entry.get().strip())
-        except ValueError:
-            return set_sett_msg("Pamięć RAM musi być liczbą, np. 4096.", True)
-        if not 1024 <= ram <= 65536:
-            return set_sett_msg("Pamięć RAM musi być w zakresie 1024–65536 MB.", True)
-        cfg.update({"memory_mb": ram, "java_path": java_entry.get().strip(),
-                    "curseforge_api_key": cf_entry.get().strip()})
-        save_config(cfg)
-        set_sett_msg("Zapisano ustawienia launchera.")
-
-    profile_cb.bind("<<ComboboxSelected>>", on_profile_pick)
-    make_button(profile_buttons, "Zapisz profil", save_profile, primary=True).pack(side="left")
-    make_button(profile_buttons, "Nowy profil", new_profile).pack(side="left", padx=8)
-    make_button(profile_buttons, "Usuń profil", delete_profile).pack(side="left")
-    make_button(profile_buttons, "Otwórz folder profilu", lambda: open_folder(current_dir())).pack(side="left", padx=8)
-    make_button(launcher_buttons, "Zapisz ustawienia", save_settings, primary=True).pack(side="left")
-
-    # ============================================================== nawigacja
-    nav = {}
-    x = 24
-    for key, label in (("play", "GRAJ"), ("mods", "MODY"), ("settings", "USTAWIENIA")):
-        nav[key] = cv.create_text(x, 24, text=label, anchor="w", font=font(13, "bold"), fill=MUTED,
-                                  tags=("nav", "nav_" + key))
-        box = cv.bbox(nav[key])
-        x = (box[2] if box else x + 12 * len(label)) + 28
-
-    def show(view):
-        if state["busy"] and view != "play":
-            return  # w trakcie logowania/uruchamiania zostajemy na ekranie gry
-        state["view"] = view
-        for key, item in nav.items():
-            cv.itemconfig(item, fill="#ffffff" if key == view else "#9aa3c7")
-        mods.place_forget()
-        sett.place_forget()
-        if view == "mods":
-            refresh_profile_labels()
-            refresh_installed()
-            mods.place(x=0, y=TOP, width=W, height=H - TOP)
-            load_results()  # najpopularniejsze mody od razu po otwarciu zakladki
-        elif view == "settings":
-            load_settings_fields()
-            sett.place(x=0, y=TOP, width=W, height=H - TOP)
-
-    for key in nav:
-        cv.tag_bind("nav_" + key, "<Button-1>", lambda e, k=key: show(k))
-    cv.tag_bind("nav", "<Enter>", lambda e: cv.config(cursor="hand2"))
-    cv.tag_bind("nav", "<Leave>", lambda e: cv.config(cursor=""))
-
-    def profile_menu(event):
-        if state["busy"]:
-            return
-        menu = tk.Menu(win, tearoff=0, bg=PANEL, fg=TEXT, activebackground=SELECT, activeforeground=TEXT)
-        for pid, p in pdata["profiles"].items():
-            mark = "✓  " if pid == pdata["selected"] else "     "
-            menu.add_command(label=mark + p["name"], command=lambda pid=pid: select_profile(pid))
+        menu = make_menu()
+        menu.add_command(label="▶  Graj", command=lambda: play(pid))
+        menu.add_command(label="Edytuj profil…", command=lambda: edit_profile(pid))
+        menu.add_command(label="Mody…", command=lambda: edit_profile(pid, "mods"))
+        menu.add_command(label="Pobierz mody…", command=lambda: open_downloader(pid))
+        menu.add_command(label="Folder profilu", command=lambda: open_folder(profile_dir(pid)))
+        menu.add_command(label="Kopiuj profil", command=copy_profile)
         menu.add_separator()
-        menu.add_command(label="Zarządzaj profilami…", command=lambda: show("settings"))
+        menu.add_command(label="Usuń profil", command=delete_profile,
+                         state="disabled" if pid == "default" or is_active(pid) else "normal")
         menu.tk_popup(event.x_root, event.y_root)
 
-    cv.tag_bind("profile", "<Button-1>", profile_menu)
-    cv.tag_bind("profile", "<Enter>", lambda e: cv.config(cursor="hand2"))
-    cv.tag_bind("profile", "<Leave>", lambda e: cv.config(cursor=""))
+    def folders_menu():
+        pid = pdata["selected"]
+        menu = make_menu()
+        menu.add_command(label="Folder launchera", command=lambda: open_folder(ROOT))
+        menu.add_command(label="Folder profilu", command=lambda: open_folder(profile_dir(pid)))
+        menu.add_command(label="Folder mods", command=lambda: open_folder(profile_dir(pid) / "mods"))
+        return menu
 
-    # ================================================== logowanie i start gry
-    def set_button(text=None, enabled=None):
-        if text is not None:
-            cv.itemconfig(btn_label, text=text)
-        if enabled is not None:
-            state["btn_on"] = enabled
-            cv.itemconfig(btn_shape, fill=GREEN if enabled else OFF)
-            cv.itemconfig(btn_label, fill="#06281b" if enabled else "#6b7294")
+    def account_menu():
+        menu = make_menu()
+        if state["account"]:
+            menu.add_command(label=f"Zalogowano: {state['account']['name']}", state="disabled")
+            menu.add_command(label="Wyloguj", command=logout)
+        else:
+            menu.add_command(label="Zaloguj przez Microsoft", command=login)
+        return menu
 
-    def set_stage(msg, error=False):
-        cv.itemconfig(stage, text=msg[:160], fill=RED if error else MUTED)
+    # ================================================================== logowanie
+    def close_login_dialog():
+        lg = state["login"]
+        if lg and lg.get("dialog") and alive(lg["dialog"]):
+            lg["dialog"].destroy()
+        if lg:
+            lg["dialog"] = None
 
-    def log(msg):
-        events.put(("stage", str(msg)))
+    def cancel_login():
+        lg = state["login"]
+        if lg:
+            lg["auth"].cancelled.set()
+            close_login_dialog()
+            set_status("Anulowanie logowania…")
 
-    def progress(done, total):
-        events.put(("progress", done, total))
-
-    def worker(fn, busy_text):
-        def run():
-            try:
-                fn()
-            except LauncherError as e:
-                events.put(("error", str(e)))
-            except Exception as e:  # siec, nieoczekiwane odpowiedzi API
-                events.put(("error", f"{type(e).__name__}: {e}"))
-            finally:
-                events.put(("idle",))
-        state["busy"] = True
-        set_button(busy_text, False)
-        threading.Thread(target=run, daemon=True).start()
-
-    def do_login():
-        def show_code(code, uri):
-            events.put(("code", code, uri))
-            webbrowser.open(uri)
-        account = MicrosoftAuth(cfg["msa_client_id"]).login(show_code)
-        state["account"] = account
-        events.put(("account", account["name"]))
-
-    def on_click(_event=None):
-        if state["busy"] or not state.get("btn_on", True) or state["view"] != "play":
+    def open_login_dialog(code, uri):
+        lg = state["login"]
+        if not lg:
             return
-        if not state["account"]:
-            return worker(do_login, "LOGOWANIE…")
-        p, game_dir, account = dict(profile()), current_dir(), state["account"]
-        launch_cfg = dict(cfg, game_version=p["game_version"], use_fabric=bool(p.get("use_fabric", True)))
+        close_login_dialog()
+        d = make_dialog("Logowanie Microsoft", 460, 310)
+        lg["dialog"] = d
+        make_label(d, "Zaloguj się kontem Microsoft", 18, bold=True, anchor="center").pack(fill="x", pady=(24, 6))
+        make_label(d, f"Wejdź na {uri} i wpisz kod:", 13, MUTED, anchor="center").pack(fill="x")
+        tk.Label(d, text=code, bg=BG, fg=GREEN, font=("Consolas", -38, "bold")).pack(pady=14)
+        make_label(d, "Kod jest już w schowku. Okno zamknie się samo po zalogowaniu.", 12, MUTED,
+                   anchor="center").pack(fill="x")
+        row = tk.Frame(d, bg=BG)
+        row.pack(pady=18)
+        make_button(row, "Otwórz stronę", lambda: webbrowser.open(uri), "primary").pack(side="left", padx=4)
+        make_button(row, "Kopiuj kod", lambda: copy(code)).pack(side="left", padx=4)
+        make_button(row, "Anuluj", cancel_login).pack(side="left", padx=4)
+        d.protocol("WM_DELETE_WINDOW", cancel_login)
+        copy(code)
 
-        def do_play():
-            proc = prepare_and_launch(launch_cfg, account, log, progress, game_dir)
-            events.put(("stage", "Gra uruchomiona"))
-            events.put(("ingame",))
-            for line in proc.stdout:
-                events.put(("gamelog", line.rstrip()))
-            events.put(("stage", f"Gra zakończona (kod {proc.wait()})"))
+    def login():
+        if state["login"]:
+            dialog = state["login"].get("dialog")
+            if dialog and alive(dialog):
+                dialog.lift()
+            return
+        try:
+            auth = MicrosoftAuth(cfg["msa_client_id"])
+        except LauncherError as e:
+            return set_status(str(e), True)
+        state["login"] = {"auth": auth, "dialog": None}
+        refresh_account()
+        set_status("Logowanie…")
 
-        worker(do_play, "URUCHAMIANIE…")
+        def show_code(code, uri):
+            ui(lambda: open_login_dialog(code, uri))
+            webbrowser.open(uri)
 
-    def on_logout(_event=None):
-        if state["busy"] or not state["account"]:
+        def done(account):
+            close_login_dialog()
+            state["login"], state["account"] = None, account
+            refresh_account()
+            set_status(f"Zalogowano jako {account['name']}")
+            pid, state["play_after"] = state["play_after"], None
+            if pid in pdata["profiles"]:
+                play(pid)
+
+        def fail(msg):
+            close_login_dialog()
+            state["login"], state["play_after"] = None, None
+            refresh_account()
+            set_status(msg, True)
+
+        background(lambda: auth.login(show_code), done, fail)
+
+    def logout():
+        if state["login"]:
             return
         try:
             AUTH_FILE.unlink()
         except OSError:
             pass
         state["account"] = None
-        cv.itemconfig(status, text="●  Niezalogowany", fill=MUTED)
-        cv.itemconfig(logout, text="")
-        set_button("ZALOGUJ PRZEZ MICROSOFT", True)
-        set_stage("Wylogowano")
+        refresh_account()
+        set_status("Wylogowano")
 
-    def hover(on):
-        if state.get("btn_on", True) and not state["busy"]:
-            cv.itemconfig(btn_shape, fill=GREEN_HI if on else GREEN)
-            cv.config(cursor="hand2" if on else "")
+    # ================================================================== gra
+    def play(pid=None):
+        pid = pid or pdata["selected"]
+        if state["preparing"] or state["running"]:
+            return set_status("Gra już działa albo właśnie się uruchamia.", True)
+        if not state["account"]:
+            state["play_after"] = pid  # po zalogowaniu gra wystartuje sama
+            return login()
+        game_dir, account = profile_dir(pid), state["account"]
+        settings = launch_settings(cfg, profile(pid))
+        state["preparing"] = pid
+        set_progress(0)
+        refresh_all()
 
-    cv.tag_bind("btn", "<Button-1>", on_click)
-    cv.tag_bind("btn", "<Enter>", lambda e: hover(True))
-    cv.tag_bind("btn", "<Leave>", lambda e: hover(False))
-    cv.tag_bind("logout", "<Button-1>", on_logout)
-    cv.tag_bind("logout", "<Enter>", lambda e: cv.config(cursor="hand2"))
-    cv.tag_bind("logout", "<Leave>", lambda e: cv.config(cursor=""))
+        def log(msg):
+            ui(lambda: set_status(msg))
 
+        def progress(done_count, total):
+            ui(lambda: set_progress(done_count / total if total else 0))
+
+        def started(proc):
+            state["preparing"], state["running"] = None, {"pid": pid, "proc": proc}
+            set_progress(1)
+            set_status(f"Gra uruchomiona ({profile(pid)['name'] if pid in pdata['profiles'] else pid})")
+            refresh_all()
+
+        def job():
+            proc = prepare_and_launch(settings, account, log, progress, game_dir)
+            ui(lambda: started(proc))
+            for line in proc.stdout:
+                ui(lambda line=line.rstrip(): write_log(line))
+            return proc.wait()
+
+        def done(code):
+            state["preparing"], state["running"] = None, None
+            set_progress(0)
+            set_status(f"Gra zakończona (kod {code})")
+            refresh_all()
+
+        def fail(msg):
+            state["preparing"], state["running"] = None, None
+            set_progress(0)
+            set_status(msg, True)
+            refresh_all()
+
+        background(job, done, fail)
+
+    def stop_game():
+        running = state["running"]
+        if running:
+            try:
+                running["proc"].terminate()
+                set_status("Zatrzymuję grę…")
+            except OSError as e:
+                set_status(f"Nie udało się zatrzymać gry: {e}", True)
+
+    # ================================================================== profile
+    def add_profile_dialog():
+        d = make_dialog("Dodaj profil", 480, 290)
+        f = tk.Frame(d, bg=BG)
+        f.pack(fill="both", expand=True, padx=24, pady=18)
+        f.columnconfigure(1, weight=1)
+        make_label(f, "Nowy profil", 18, bold=True).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        name_e, ver_cb, fabric = make_entry(f), make_combobox(f, state["versions"]), tk.BooleanVar(value=True)
+        name_e.insert(0, f"Profil {len(pdata['profiles']) + 1}")
+        ver_cb.set("latest")
+        form_row(f, 1, "Nazwa", name_e)
+        form_row(f, 2, "Wersja gry", ver_cb)
+        make_check(f, "Fabric (wymagany do modów)", fabric).grid(row=3, column=1, sticky="w", pady=4)
+        msg = make_label(f, "", 12, RED)
+        msg.grid(row=4, column=0, columnspan=2, sticky="w")
+
+        def create():
+            name, version = name_e.get().strip()[:40], ver_cb.get().strip() or "latest"
+            if not name:
+                return msg.config(text="Podaj nazwę profilu.")
+            if not valid_game_version(version):
+                return msg.config(text="Wersja gry musi mieć postać np. 26.3 albo „latest”.")
+            pid = new_profile_id(name, pdata["profiles"])
+            pdata["profiles"][pid] = {"name": name, "game_version": version, "use_fabric": bool(fabric.get())}
+            pdata["selected"] = pid
+            save_profiles(pdata)
+            d.destroy()
+            refresh_all()
+            set_status(f"Utworzono profil „{name}”")
+
+        row = tk.Frame(f, bg=BG)
+        row.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        make_button(row, "Anuluj", d.destroy).pack(side="right")
+        make_button(row, "Utwórz", create, "primary").pack(side="right", padx=8)
+        d.bind("<Return>", lambda e: create())
+        name_e.focus_set()
+
+    def copy_profile():
+        pid, p = pdata["selected"], dict(profile())
+        if is_active(pid):
+            return set_status("Nie można kopiować profilu, gdy gra jest uruchomiona.", True)
+        name = shorten(p["name"] + " (kopia)", 40)
+        new = new_profile_id(name, pdata["profiles"])
+        src, dst = profile_dir(pid), profile_dir(new)
+        set_status(f"Kopiuję profil „{p['name']}”…")
+
+        def done(_):
+            pdata["profiles"][new] = dict(p, name=name)
+            pdata["selected"] = new
+            save_profiles(pdata)
+            refresh_all()
+            set_status(f"Skopiowano profil jako „{name}”")
+
+        background(lambda: copy_profile_files(src, dst), done, lambda m: set_status(m, True))
+
+    def delete_profile():
+        pid = pdata["selected"]
+        if pid == "default":
+            return set_status("Profilu domyślnego nie można usunąć.", True)
+        if is_active(pid):
+            return set_status("Zamknij grę przed usunięciem profilu.", True)
+        folder = profile_dir(pid)
+        if not messagebox.askyesno(NAME, f"Usunąć profil „{profile()['name']}” z listy?\n\n"
+                                         f"Pliki (światy, mody) zostaną na dysku w:\n{folder}", parent=root):
+            return
+        for store in ("editors", "downloaders"):
+            window = state[store].pop(pid, None)
+            if window and alive(window["win"]):
+                window["win"].destroy()
+        del pdata["profiles"][pid]
+        pdata["selected"] = "default" if "default" in pdata["profiles"] else next(iter(pdata["profiles"]))
+        save_profiles(pdata)
+        refresh_all()
+        set_status(f"Usunięto profil z listy. Jego pliki zostały w {folder}")
+
+    def mods_changed(pid):
+        editor = state["editors"].get(pid)
+        if editor and alive(editor["win"]):
+            editor["refresh_mods"]()
+        downloader = state["downloaders"].get(pid)
+        if downloader and alive(downloader["win"]):
+            downloader["render"]()
+        if pid == pdata["selected"]:
+            refresh_side()
+
+    # ============================================================= edycja profilu
+    def edit_profile(pid=None, page="version"):
+        pid = pid or pdata["selected"]
+        editor = state["editors"].get(pid)
+        if editor and alive(editor["win"]):
+            editor["show"](page)
+            editor["win"].lift()
+            return
+        p = pdata["profiles"][pid]
+        d = make_dialog(f"Profil – {p['name']}", 800, 540, resizable=True)
+        nav = tk.Frame(d, bg=PANEL, width=180)
+        nav.pack(side="left", fill="y")
+        nav.pack_propagate(False)
+        content = tk.Frame(d, bg=BG)
+        content.pack(side="left", fill="both", expand=True)
+        pages, nav_buttons = {}, {}
+        editor = {"win": d}
+        state["editors"][pid] = editor
+
+        # --- Wersja
+        pv = tk.Frame(content, bg=BG)
+        pv.columnconfigure(1, weight=1)
+        make_label(pv, "Wersja", 18, bold=True).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        name_e, ver_cb = make_entry(pv), make_combobox(pv, state["versions"])
+        fabric = tk.BooleanVar(value=bool(p.get("use_fabric", True)))
+        name_e.insert(0, p["name"])
+        ver_cb.set(p["game_version"])
+        form_row(pv, 1, "Nazwa", name_e)
+        form_row(pv, 2, "Wersja gry („latest” = najnowsza)", ver_cb)
+        make_check(pv, "Fabric (wymagany do modów)", fabric).grid(row=3, column=1, sticky="w", pady=4)
+        pv_msg = make_label(pv, "", 12, GREEN)
+        pv_msg.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        def save_version():
+            name, version = name_e.get().strip()[:40], ver_cb.get().strip() or "latest"
+            if is_active(pid):
+                return pv_msg.config(text="Zamknij grę przed zmianą wersji.", fg=RED)
+            if not name:
+                return pv_msg.config(text="Nazwa profilu nie może być pusta.", fg=RED)
+            if not valid_game_version(version):
+                return pv_msg.config(text="Wersja gry musi mieć postać np. 26.3 albo „latest”.", fg=RED)
+            p.update(name=name, game_version=version, use_fabric=bool(fabric.get()))
+            save_profiles(pdata)
+            d.title(f"Profil – {name}")
+            refresh_all()
+            refresh_mods()
+            pv_msg.config(text="Zapisano.", fg=GREEN)
+
+        make_button(pv, "Zapisz", save_version, "primary").grid(row=4, column=1, sticky="w", pady=(12, 0))
+        pages["version"] = pv
+
+        # --- Mody
+        pm = tk.Frame(content, bg=BG)
+        make_label(pm, "Mody", 18, bold=True).pack(fill="x", pady=(0, 10))
+        mods_bar = tk.Frame(pm, bg=BG)
+        mods_bar.pack(fill="x")
+        mods_lb = make_listbox(pm, 14)
+        mods_lb.pack(fill="both", expand=True, pady=(10, 6))
+        pm_msg = make_label(pm, "", 12, MUTED, wraplength=560)
+        pm_msg.pack(fill="x")
+        rows = []
+
+        def refresh_mods():
+            rows[:] = list_installed(profile_dir(pid))
+            mods_lb.delete(0, "end")
+            for m in rows:
+                label = m["title"] if m["title"] == m["base"] else f"{m['title']}   ·   {m['base']}"
+                mods_lb.insert("end", ("☑  " if m["enabled"] else "☐  ") + label)
+            if not p.get("use_fabric", True):
+                pm_msg.config(text="Ten profil nie ma Fabrica, więc mody nie zostaną wczytane.", fg=RED)
+            elif not rows:
+                pm_msg.config(text="Brak modów. Kliknij „Pobierz mody…”.", fg=MUTED)
+            else:
+                pm_msg.config(text=f"{plural_mods(len(rows))}, włączone: {sum(m['enabled'] for m in rows)}. "
+                                   "Dwuklik włącza lub wyłącza mod.", fg=MUTED)
+
+        def selected_mod():
+            sel = mods_lb.curselection()
+            return rows[sel[0]] if sel and sel[0] < len(rows) else None
+
+        def toggle(_event=None):
+            m = selected_mod()
+            if not m:
+                return pm_msg.config(text="Zaznacz mod na liście.", fg=RED)
+            try:
+                enabled = toggle_mod(profile_dir(pid), m["file"])
+            except (OSError, LauncherError) as e:
+                return pm_msg.config(text=f"Nie udało się: {e}", fg=RED)
+            mods_changed(pid)
+            pm_msg.config(text=f"{'Włączono' if enabled else 'Wyłączono'}: {m['title']}", fg=GREEN)
+
+        def remove():
+            m = selected_mod()
+            if not m:
+                return pm_msg.config(text="Zaznacz mod na liście.", fg=RED)
+            if not messagebox.askyesno(NAME, f"Usunąć plik {m['base']} z profilu?", parent=d):
+                return
+            try:
+                remove_mod(profile_dir(pid), m["file"])
+            except (OSError, LauncherError) as e:
+                return pm_msg.config(text=f"Nie udało się usunąć: {e}", fg=RED)
+            mods_changed(pid)
+            pm_msg.config(text=f"Usunięto: {m['title']}", fg=GREEN)
+
+        make_button(mods_bar, "Pobierz mody…", lambda: open_downloader(pid), "primary").pack(side="left")
+        make_button(mods_bar, "Włącz / wyłącz", toggle).pack(side="left", padx=(8, 0))
+        make_button(mods_bar, "Usuń", remove, "danger").pack(side="left", padx=(8, 0))
+        make_button(mods_bar, "Folder mods", lambda: open_folder(profile_dir(pid) / "mods")).pack(side="left", padx=(8, 0))
+        make_button(mods_bar, "Odśwież", lambda: mods_changed(pid)).pack(side="left", padx=(8, 0))
+        mods_lb.bind("<Double-Button-1>", toggle)
+        pages["mods"] = pm
+        editor["refresh_mods"] = refresh_mods
+
+        # --- Ustawienia
+        ps = tk.Frame(content, bg=BG)
+        ps.columnconfigure(1, weight=1)
+        make_label(ps, "Ustawienia profilu", 18, bold=True).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ram_e, jvm_e = make_entry(ps), make_entry(ps)
+        ram_e.insert(0, str(p.get("memory_mb") or ""))
+        jvm_e.insert(0, p.get("jvm_args", ""))
+        form_row(ps, 1, "Pamięć RAM (MB)", ram_e)
+        make_label(ps, f"Puste = ustawienie globalne ({cfg.get('memory_mb', 4096)} MB)", 12, MUTED).grid(
+            row=2, column=1, sticky="w")
+        form_row(ps, 3, "Dodatkowe argumenty JVM", jvm_e)
+        ps_msg = make_label(ps, "", 12, GREEN)
+        ps_msg.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        def save_settings():
+            text = ram_e.get().strip()
+            if text:
+                try:
+                    ram = int(text)
+                except ValueError:
+                    return ps_msg.config(text="Pamięć RAM musi być liczbą, np. 4096.", fg=RED)
+                if not 1024 <= ram <= 65536:
+                    return ps_msg.config(text="Pamięć RAM musi być w zakresie 1024–65536 MB.", fg=RED)
+                p["memory_mb"] = ram
+            else:
+                p.pop("memory_mb", None)
+            args = jvm_e.get().strip()
+            if args:
+                p["jvm_args"] = args[:500]
+            else:
+                p.pop("jvm_args", None)
+            save_profiles(pdata)
+            ps_msg.config(text="Zapisano. Zmiany zadziałają przy następnym uruchomieniu gry.", fg=GREEN)
+
+        make_button(ps, "Zapisz", save_settings, "primary").grid(row=4, column=1, sticky="w", pady=(12, 0))
+        pages["settings"] = ps
+
+        def show(page_name):
+            for frame in pages.values():
+                frame.pack_forget()
+            pages[page_name].pack(fill="both", expand=True, padx=22, pady=18)
+            for key, button in nav_buttons.items():
+                button.config(bg=SELECT if key == page_name else PANEL)
+            if page_name == "mods":
+                refresh_mods()
+
+        make_label(nav, shorten(p["name"], 18), 14, TEXT, bold=True, bg=PANEL).pack(fill="x", padx=16, pady=(18, 10))
+        for key, label in (("version", "Wersja"), ("mods", "Mody"), ("settings", "Ustawienia")):
+            button = tk.Button(nav, text=label, anchor="w", relief="flat", bd=0, padx=16, pady=8, cursor="hand2",
+                               font=font(13), bg=PANEL, fg=TEXT, activebackground=SELECT, activeforeground=TEXT,
+                               highlightthickness=0, command=lambda k=key: show(k))
+            button.pack(fill="x")
+            nav_buttons[key] = button
+        editor["show"] = show
+
+        def close():
+            state["editors"].pop(pid, None)
+            d.destroy()
+
+        d.protocol("WM_DELETE_WINDOW", close)
+        show(page)
+
+    # ============================================================ pobieranie modów
+    def open_downloader(pid=None):
+        pid = pid or pdata["selected"]
+        dl = state["downloaders"].get(pid)
+        if dl and alive(dl["win"]):
+            dl["win"].lift()
+            return
+        d = make_dialog(f"Pobierz mody – {profile(pid)['name']}", 960, 600, resizable=True)
+        dl = {"win": d, "source": "modrinth", "results": [], "key": None, "req": 0, "end": False}
+        state["downloaders"][pid] = dl
+
+        top = tk.Frame(d, bg=PANEL)
+        top.pack(fill="x")
+        source_buttons = {}
+        for key, label in (("modrinth", "Modrinth"), ("curseforge", "CurseForge")):
+            button = make_button(top, label, lambda k=key: set_source(k))
+            button.pack(side="left", padx=(12 if key == "modrinth" else 2, 0), pady=10)
+            source_buttons[key] = button
+        query = make_entry(top)
+        query.pack(side="left", fill="x", expand=True, padx=(14, 8), ipady=4)
+        sort_cb = make_combobox(top, [s[0] for s in SORTS], readonly=True)
+        sort_cb.set(SORTS[0][0])
+        sort_cb.pack(side="left")
+        make_button(top, "Szukaj", lambda: load(force=True), "primary").pack(side="left", padx=12)
+
+        bottom = tk.Frame(d, bg=PANEL)
+        bottom.pack(side="bottom", fill="x")
+        make_button(bottom, "Pokaż więcej", lambda: load(more=True)).pack(side="left", padx=12, pady=8)
+        info = make_label(bottom, "", 12, MUTED, bg=PANEL)
+        info.pack(side="left", padx=6)
+        make_button(bottom, "Zamknij", lambda: close()).pack(side="right", padx=12)
+
+        content = tk.Frame(d, bg=BG)
+        content.pack(fill="both", expand=True)
+        details = tk.Frame(content, bg=PANEL, width=320)
+        details.pack(side="right", fill="y")
+        details.pack_propagate(False)
+        results_lb = make_listbox(content, 20)
+        results_scroll = ttk.Scrollbar(content, orient="vertical", command=results_lb.yview)
+        results_lb.configure(yscrollcommand=results_scroll.set)
+        results_scroll.pack(side="right", fill="y", pady=12)
+        results_lb.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=12)
+        det_title = make_label(details, "", 17, TEXT, bold=True, bg=PANEL, wraplength=290)
+        det_title.pack(fill="x", padx=16, pady=(16, 2))
+        det_meta = make_label(details, "", 12, MUTED, bg=PANEL, wraplength=290)
+        det_meta.pack(fill="x", padx=16)
+        det_desc = make_label(details, "Wybierz mod z listy.", 13, TEXT, bg=PANEL, wraplength=290)
+        det_desc.pack(fill="x", padx=16, pady=(12, 0))
+        install_btn = make_button(details, "Zainstaluj", lambda: install(), "primary")
+        install_btn.pack(side="bottom", fill="x", padx=16, pady=16, ipady=3)
+        det_msg = make_label(details, "", 12, MUTED, bg=PANEL, wraplength=290)
+        det_msg.pack(side="bottom", fill="x", padx=16)
+
+        def installed_keys():
+            return {(i.get("source"), str(i.get("id"))) for i in load_mods_index(profile_dir(pid)).values()}
+
+        def selected():
+            sel = results_lb.curselection()
+            return dl["results"][sel[0]] if sel and sel[0] < len(dl["results"]) else None
+
+        def show_details(_event=None):
+            r = selected()
+            if not r:
+                det_title.config(text="")
+                det_meta.config(text="")
+                det_desc.config(text="Wybierz mod z listy.")
+                install_btn.config(text="Zainstaluj", state="disabled")
+                return
+            meta = [f"{format_count(r['downloads'])} pobrań"]
+            if r.get("author"):
+                meta.insert(0, f"autor: {r['author']}")
+            det_title.config(text=r["title"])
+            det_meta.config(text="  ·  ".join(meta))
+            det_desc.config(text=shorten(r.get("description", ""), 400))
+            have = (r["source"], str(r["id"])) in installed_keys()
+            install_btn.config(text="Zainstaluj ponownie / zaktualizuj" if have else "Zainstaluj", state="normal")
+
+        def render():
+            have = installed_keys()
+            results_lb.delete(0, "end")
+            for r in dl["results"]:
+                mark = "✓  " if (r["source"], str(r["id"])) in have else "     "
+                results_lb.insert("end", f"{mark}{r['title']}   ·   {format_count(r['downloads'])} pobrań")
+            show_details()
+
+        dl["render"] = render
+
+        def ready():
+            p = pdata["profiles"].get(pid)
+            problem = None
+            if not p:
+                problem = "Ten profil został usunięty."
+            elif not p.get("use_fabric", True):
+                problem = "Ten profil nie ma Fabrica. Włącz go w edycji profilu."
+            elif dl["source"] == "curseforge" and not cfg.get("curseforge_api_key"):
+                problem = "CurseForge wymaga klucza API. Wpisz go w Ustawieniach."
+            if problem:
+                dl["results"], dl["key"] = [], None
+                render()
+                info.config(text=problem, fg=RED)
+                return False
+            return True
+
+        def load(more=False, force=False):
+            """Bez wpisanego tekstu pokazuje najpopularniejsze mody; more=True doczytuje kolejna strone."""
+            if not ready():
+                return
+            text, src, key = query.get().strip(), dl["source"], cfg.get("curseforge_api_key", "")
+            sort = dict(SORTS).get(sort_cb.get(), "downloads") if src == "modrinth" else None
+            if src == "modrinth" and not text and sort == "relevance":
+                sort = "downloads"  # bez zapytania "trafnosc" nie ma sensu
+            wanted = profile(pid)["game_version"]
+            request_key = (src, wanted, text, sort)
+            if more and (dl["key"] != request_key or dl["end"]):
+                return
+            if not more and not force and request_key == dl["key"] and dl["results"]:
+                return render()
+            offset = len(dl["results"]) if more else 0
+            dl["req"] += 1
+            req = dl["req"]
+            info.config(text="Wczytuję kolejne…" if more else ("Szukam…" if text else "Wczytuję najpopularniejsze mody…"),
+                        fg=MUTED)
+
+            def job():
+                version = resolve_game_version(wanted)
+                if src == "modrinth":
+                    return version, modrinth_search(text, version, PAGE, offset, sort)
+                return version, curseforge_search(text, version, key, PAGE, offset)
+
+            def done(result):
+                if req != dl["req"] or not alive(d):
+                    return  # w miedzyczasie zlecono nowsze wyszukiwanie albo okno zamknieto
+                version, hits = result
+                if more:
+                    seen = {(h["source"], str(h["id"])) for h in dl["results"]}
+                    hits = [h for h in hits if (h["source"], str(h["id"])) not in seen]
+                    dl["results"] += hits
+                else:
+                    dl["results"] = hits
+                dl["key"], dl["end"] = request_key, len(hits) < PAGE
+                render()
+                where = "Modrinth" if src == "modrinth" else "CurseForge"
+                if not dl["results"]:
+                    info.config(text=f"Brak modów dla Minecraft {version} z Fabric", fg=MUTED)
+                elif text:
+                    info.config(text=f"{where}: {len(dl['results'])} wyników dla „{shorten(text, 30)}” "
+                                     f"(Minecraft {version})", fg=MUTED)
+                else:
+                    info.config(text=f"{where}: najpopularniejsze mody dla Minecraft {version} "
+                                     f"({len(dl['results'])})", fg=MUTED)
+
+            def fail(msg):
+                if req == dl["req"] and alive(d):
+                    info.config(text=shorten(msg, 110), fg=RED)
+                write_log("BŁĄD: " + msg)
+
+            background(job, done, fail)
+
+        def set_source(src):
+            dl["source"] = src
+            for key, button in source_buttons.items():
+                button.config(bg=SELECT if key == src else PANEL2)
+            sort_cb.config(state="readonly" if src == "modrinth" else "disabled")
+            load()
+
+        def install():
+            r = selected()
+            if not r:
+                return det_msg.config(text="Zaznacz mod na liście.", fg=RED)
+            if not ready():
+                return
+            if is_active(pid):
+                return det_msg.config(text="Zamknij grę przed instalowaniem modów.", fg=RED)
+            wanted, key, game_dir = profile(pid)["game_version"], cfg.get("curseforge_api_key", ""), profile_dir(pid)
+            install_btn.config(state="disabled")
+            det_msg.config(text=f"Instaluję: {r['title']}…", fg=MUTED)
+
+            def job():
+                names = []
+                try:
+                    install_mod(r, resolve_game_version(wanted), game_dir, key, names.append)
+                except LauncherError as e:
+                    raise LauncherError(str(e) + (f" (pobrano już: {', '.join(names)})" if names else ""))
+                return names
+
+            def done(names):
+                mods_changed(pid)
+                if alive(d):
+                    det_msg.config(text="Zainstalowano: " + ", ".join(names), fg=GREEN)
+                set_status(f"Zainstalowano w profilu „{profile(pid)['name']}”: {', '.join(names)}")
+
+            def fail(msg):
+                mods_changed(pid)  # czesc zaleznosci mogla sie juz pobrac
+                if alive(d):
+                    det_msg.config(text=msg, fg=RED)
+                write_log("BŁĄD: " + msg)
+
+            background(job, done, fail)
+
+        def close():
+            state["downloaders"].pop(pid, None)
+            d.destroy()
+
+        results_lb.bind("<<ListboxSelect>>", show_details)
+        results_lb.bind("<Double-Button-1>", lambda e: install())
+        query.bind("<Return>", lambda e: load(force=True))
+        sort_cb.bind("<<ComboboxSelected>>", lambda e: load(force=True))
+        d.protocol("WM_DELETE_WINDOW", close)
+        set_source("modrinth")  # od razu wczytuje najpopularniejsze mody
+        query.focus_set()
+
+    # ============================================================ ustawienia, konsola
+    def settings_dialog():
+        d = make_dialog("Ustawienia", 600, 340)
+        f = tk.Frame(d, bg=BG)
+        f.pack(fill="both", expand=True, padx=24, pady=18)
+        f.columnconfigure(1, weight=1)
+        make_label(f, "Ustawienia launchera", 18, bold=True).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ram_e, java_e, cf_e = make_entry(f), make_entry(f), make_entry(f, show="•")
+        ram_e.insert(0, str(cfg.get("memory_mb", 4096)))
+        java_e.insert(0, cfg.get("java_path", ""))
+        cf_e.insert(0, cfg.get("curseforge_api_key", ""))
+        form_row(f, 1, "Pamięć RAM dla gry (MB)", ram_e)
+        form_row(f, 2, "Ścieżka do Javy (puste = automatycznie)", java_e)
+        form_row(f, 3, "Klucz API CurseForge", cf_e)
+        msg = make_label(f, "", 12, GREEN)
+        msg.grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        def save():
+            try:
+                ram = int(ram_e.get().strip())
+            except ValueError:
+                return msg.config(text="Pamięć RAM musi być liczbą, np. 4096.", fg=RED)
+            if not 1024 <= ram <= 65536:
+                return msg.config(text="Pamięć RAM musi być w zakresie 1024–65536 MB.", fg=RED)
+            cfg.update(memory_mb=ram, java_path=java_e.get().strip(), curseforge_api_key=cf_e.get().strip())
+            save_config(cfg)
+            msg.config(text="Zapisano.", fg=GREEN)
+            set_status("Zapisano ustawienia launchera")
+
+        row = tk.Frame(f, bg=BG)
+        row.grid(row=5, column=0, columnspan=2, sticky="we", pady=(14, 0))
+        make_button(row, "Zapisz", save, "primary").pack(side="left")
+        make_button(row, "Folder launchera", lambda: open_folder(ROOT)).pack(side="left", padx=8)
+        make_button(row, "Zamknij", d.destroy).pack(side="right")
+
+    def open_console():
+        console = state["console"]
+        if console and alive(console["win"]):
+            console["win"].lift()
+            return
+        d = make_dialog("Konsola", 860, 480, resizable=True)
+        bar = tk.Frame(d, bg=PANEL)
+        bar.pack(side="bottom", fill="x")
+        text = tk.Text(d, bg=PANEL, fg="#aab2d5", relief="flat", bd=0, padx=10, pady=8, wrap="none",
+                       font=("Consolas", -12), insertbackground=TEXT, highlightthickness=0)
+        text.pack(fill="both", expand=True)
+        if state["log"]:
+            text.insert("end", "\n".join(state["log"]) + "\n")
+            text.see("end")
+
+        def clear():
+            state["log"].clear()
+            text.delete("1.0", "end")
+
+        make_button(bar, "Kopiuj wszystko", lambda: copy("\n".join(state["log"]))).pack(side="left", padx=12, pady=8)
+        make_button(bar, "Wyczyść", clear).pack(side="left")
+        state["console"] = {"win": d, "text": text}
+
+        def close():
+            state["console"] = None
+            d.destroy()
+
+        d.protocol("WM_DELETE_WINDOW", close)
+
+    # ================================================================== start
     def pump():
-        try:
-            while True:
-                ev = events.get_nowait()
-                kind = ev[0]
-                if kind == "ui":
-                    ev[1]()
-                elif kind == "stage":
-                    set_stage(ev[1])
-                    write_log(ev[1])
-                elif kind == "gamelog":
-                    write_log(ev[1])
-                elif kind == "error":
-                    set_stage("Błąd: " + ev[1].splitlines()[0], error=True)
-                    write_log("BŁĄD: " + ev[1])
-                    cv.itemconfig(code_text, text="")
-                    cv.itemconfig(hint, text="")
-                elif kind == "progress":
-                    frac = ev[1] / ev[2] if ev[2] else 0
-                    cv.coords(bar, PX0, PY - 3, PX0 + (PX1 - PX0) * frac, PY + 3)
-                elif kind == "code":
-                    cv.itemconfig(code_text, text=ev[1])
-                    cv.itemconfig(hint, text=f"Wpisz ten kod na {ev[2]} (jest już w schowku)")
-                    write_log(f"Kod logowania: {ev[1]}  ->  {ev[2]}")
-                    win.clipboard_clear()
-                    win.clipboard_append(ev[1])
-                elif kind == "account":
-                    cv.itemconfig(status, text=f"●  Zalogowano: {ev[1]}", fill=GREEN)
-                    cv.itemconfig(code_text, text="")
-                    cv.itemconfig(hint, text="")
-                    cv.itemconfig(logout, text="Wyloguj")
-                    set_stage("Gotowe do gry")
-                elif kind == "ingame":
-                    cv.coords(bar, PX0, PY - 3, PX1, PY + 3)
-                    set_button("W GRZE", False)
-                elif kind == "idle":
-                    state["busy"] = False
-                    cv.coords(bar, PX0, PY - 3, PX0, PY + 3)
-                    set_button("GRAJ" if state["account"] else "ZALOGUJ PRZEZ MICROSOFT", True)
-        except queue.Empty:
-            pass
-        win.after(100, pump)
+        for _ in range(500):  # limit na jedno odswiezenie, zeby okno nie zamarzlo przy duzym logu
+            try:
+                fn = events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as e:  # blad w obsludze zdarzenia nie moze zatrzymac okna
+                write_log(f"BŁĄD interfejsu: {type(e).__name__}: {e}")
+        root.after(50, pump)
 
-    refresh_profile_labels()
-    show("play")
+    root.bind("<Return>", lambda e: play())
+    refresh_all()
     write_log(f"Folder launchera: {ROOT}")
-    background(list_release_versions, lambda versions: version_cb.config(values=["latest"] + versions),
-               lambda msg, error=True: write_log(f"Nie udało się pobrać listy wersji: {msg}"))
-    if AUTH_FILE.exists() and cfg["msa_client_id"]:
-        worker(do_login, "LOGOWANIE…")  # ciche odswiezenie zapisanej sesji
+    background(list_release_versions, lambda versions: state.update(versions=["latest"] + versions),
+               lambda msg: write_log(f"Nie udało się pobrać listy wersji: {msg}"))
+    if AUTH_FILE.exists() and cfg.get("msa_client_id"):
+        login()  # ciche odswiezenie zapisanej sesji; okno z kodem pojawi sie tylko w razie potrzeby
     pump()
-    win.mainloop()
+    root.mainloop()
 
 
 if __name__ == "__main__":

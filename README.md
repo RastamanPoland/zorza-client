@@ -10,7 +10,8 @@ Zorza Client is a hobby launcher for **Minecraft: Java Edition** that installs F
 - Installs Fabric Loader from `meta.fabricmc.net`.
 - Signs in **only with a Microsoft account** (OAuth 2.0 device code flow → Xbox Live → XSTS → Minecraft Services).
 - Keeps its files in a separate folder (`.zorza`), so it does not touch the official launcher's installation.
-- Profiles: each profile has its own game folder (mods, worlds, options), game version and Fabric toggle.
+- Prism-style layout: profile tiles, side panel with actions, profile editor (version, mods, per-profile RAM and JVM arguments) and a separate mod browser.
+- Profiles: each profile has its own game folder (mods, worlds, options), game version and Fabric toggle. Mods can be enabled or disabled without deleting them.
 - Installs Fabric mods from **Modrinth** and **CurseForge** (CurseForge requires the user's own API key), including required dependencies. Mods whose authors disallow third-party distribution are not downloaded.
 
 ## What it does not do
