@@ -10,9 +10,11 @@ Fabric z meta.fabricmc.net. Logowanie wylacznie kontem Microsoft.
 """
 import hashlib
 import json
+import math
 import os
 import platform
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -347,7 +349,7 @@ class MicrosoftAuth:
         code, dev = post_json_lenient(f"{MSA}/devicecode", form=True, data={
             "client_id": self.client_id, "scope": "XboxLive.signin offline_access"})
         if code != 200:
-            raise LauncherError(f"Microsoft odrzucil aplikacje: {dev.get('error_description', dev)}")
+            raise LauncherError(f"Microsoft odrzucił aplikację: {dev.get('error_description', dev)}")
         show_code(dev["user_code"], dev["verification_uri"])
         deadline = time.time() + int(dev.get("expires_in", 900))
         interval = int(dev.get("interval", 5))
@@ -363,7 +365,7 @@ class MicrosoftAuth:
                 interval += 5
             elif err != "authorization_pending":
                 raise LauncherError(f"Logowanie przerwane: {tok.get('error_description', err)}")
-        raise LauncherError("Kod logowania wygasl, sprobuj ponownie")
+        raise LauncherError("Kod logowania wygasł, spróbuj ponownie")
 
     def login(self, show_code) -> dict:
         tok = self._msa_token(show_code)
@@ -389,15 +391,15 @@ class MicrosoftAuth:
         code, mc = post_json_lenient("https://api.minecraftservices.com/authentication/login_with_xbox",
                                      {"identityToken": f"XBL3.0 x={uhs};{xsts['Token']}"})
         if code != 200:
-            hint = (" Aplikacja Azure nie ma jeszcze zgody Mojangu na API Minecrafta."
+            hint = (" Aplikacja nie ma jeszcze zgody Mojangu na API Minecrafta."
                     if code == 403 else "")
-            raise LauncherError(f"Minecraft Services odrzucil logowanie ({code}).{hint}")
+            raise LauncherError(f"Minecraft Services odrzucił logowanie ({code}).{hint}")
         try:
             prof = get_json("https://api.minecraftservices.com/minecraft/profile",
                             headers={"Authorization": "Bearer " + mc["access_token"]})
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                raise LauncherError("To konto nie posiada Minecraft: Java Edition")
+                raise LauncherError("To konto nie ma kupionego Minecraft: Java Edition")
             raise
         return {"name": prof["name"], "uuid": prof["id"], "token": mc["access_token"]}
 
@@ -446,20 +448,20 @@ def build_command(v, account, java, classpath, cfg) -> list:
 def prepare_and_launch(cfg, account, log=print, progress=None) -> subprocess.Popen:
     for d in (LIBS, ASSETS, VERSIONS, RUNTIMES, GAME_DIR / "mods"):
         d.mkdir(parents=True, exist_ok=True)
-    log("Sprawdzam wersje...")
+    log("Sprawdzam wersję…")
     v = resolve_version(cfg, log)
     vid = v["_id"]
     log(f"Minecraft {vid}" + (" + Fabric" if v["_fabric"] else ""))
     lib_tasks, classpath = collect_libraries(v)
     client = v["downloads"]["client"]
     client_task = (client["url"], VERSIONS / vid / f"{vid}.jar", client.get("sha1"), client.get("size"))
-    log("Pobieram biblioteki i gre...")
+    log("Pobieram biblioteki i grę…")
     download_all(lib_tasks + [client_task], progress)
-    log("Pobieram zasoby...")
+    log("Pobieram zasoby…")
     download_all(collect_assets(v), progress, workers=16)
     java = ensure_java(v, cfg, log, progress)
     cmd = build_command(v, account, java, classpath, cfg)
-    log(f"Uruchamiam gre jako {account['name']}...")
+    log(f"Uruchamiam grę jako {account['name']}…")
     return subprocess.Popen(cmd, cwd=GAME_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, encoding="utf-8", errors="replace")
 
@@ -467,6 +469,10 @@ def prepare_and_launch(cfg, account, log=print, progress=None) -> subprocess.Pop
 # ---------------------------------------------------------------- interfejsy
 
 def run_cli():
+    try:
+        sys.stdout.reconfigure(errors="replace")  # konsola Windows bez pelnego Unicode
+    except AttributeError:
+        pass
     cfg = load_config()
     auth = MicrosoftAuth(cfg["msa_client_id"])
     account = auth.login(lambda code, uri: print(f"Wejdz na {uri} i wpisz kod: {code}"))
@@ -481,9 +487,60 @@ def run_cli():
     sys.exit(proc.wait())
 
 
+def render_aurora(w, h, bg=(11, 13, 26)):
+    """Rysuje zorze polarna piksel po pikselu. Zwraca wiersze kolorow '#rrggbb'."""
+    rnd = random.Random(7)
+    top = (4, 6, 16)
+    ribbons = [  # kolor, wysokosc (ulamek h), amplituda, czestotliwosc, faza, dlugosc smugi
+        ((61, 220, 151), 0.74, 0.07, 0.0105, 0.4, 0.26),
+        ((43, 196, 201), 0.62, 0.06, 0.0160, 2.1, 0.20),
+        ((139, 92, 246), 0.50, 0.08, 0.0085, 4.0, 0.22),
+    ]
+    sx = 380.0 / w  # ksztalt nie zalezy od rozdzielczosci
+    px = []
+    for y in range(h):
+        t = y / max(1, h - 1)
+        base = tuple(top[i] + (bg[i] - top[i]) * t for i in range(3))
+        px.append([list(base) for _ in range(w)])
+    for _ in range(int(w * h / 1400)):  # gwiazdy
+        x, y, b = rnd.randrange(w), rnd.randrange(int(h * 0.7)), rnd.randint(50, 170)
+        for i in range(3):
+            px[y][x][i] += b
+    fade = [min(1.0, (h - y) / (h * 0.22)) * min(1.0, 0.15 + y / (h * 0.30)) for y in range(h)]
+    for color, y0, amp, freq, phase, length in ribbons:
+        L = max(2.0, length * h)
+        up = [math.exp(-d / L) for d in range(h + 1)]
+        down = [math.exp(-d / (0.03 * h)) for d in range(h + 1)]
+        for x in range(w):
+            u = x * sx
+            c = h * (y0 + amp * math.sin(u * freq + phase) + amp * 0.35 * math.sin(u * freq * 2.7 + phase * 1.9))
+            ci = int(c)
+            streak = 0.52 + 0.20 * math.sin(u * 0.045 + phase * 3) + 0.10 * math.sin(u * 0.17 + phase) + 0.05 * math.sin(u * 0.41)
+            for y in range(max(0, int(c - 4 * L)), min(h, ci + int(0.12 * h))):
+                k = (up[ci - y] if y <= ci else down[y - ci]) * streak * fade[y]
+                if k > 0.004:
+                    cell = px[y][x]
+                    cell[0] += color[0] * k
+                    cell[1] += color[1] * k
+                    cell[2] += color[2] * k
+    return [["#%02x%02x%02x" % tuple(min(255, max(0, int(v))) for v in cell) for cell in row] for row in px]
+
+
+def round_points(x1, y1, x2, y2, r):
+    return [x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y1 + r,
+            x2, y2 - r, x2, y2 - r, x2, y2, x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2,
+            x1, y2, x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1]
+
+
 def run_gui():
     import tkinter as tk
-    from tkinter import ttk
+
+    W, H, HEADER = 760, 640, 250
+    BG, PANEL, TEXT, MUTED = "#0b0d1a", "#11142a", "#e9ecff", "#8088a8"
+    GREEN, GREEN_HI, RED, OFF = "#3ddc97", "#6ff0b6", "#ff7a90", "#2a2f4a"
+
+    def font(px, *style):
+        return ("Segoe UI", -px) + style  # ujemny rozmiar = piksele, uklad nie zalezy od DPI
 
     cfg = load_config()
     events = queue.Queue()
@@ -491,52 +548,91 @@ def run_gui():
 
     win = tk.Tk()
     win.title(f"{NAME} {VERSION}")
-    win.geometry("560x420")
-    win.configure(bg="#14121f")
-    style = ttk.Style(win)
-    style.theme_use("clam")
-    style.configure("TButton", padding=8, font=("Segoe UI", 11))
-    style.configure("Horizontal.TProgressbar", troughcolor="#221f33", background="#7c5cff")
+    win.configure(bg=BG)
+    win.resizable(False, False)
+    win.geometry(f"{W}x{H}+{max(0, (win.winfo_screenwidth() - W) // 2)}+{max(0, (win.winfo_screenheight() - H) // 3)}")
+    cv = tk.Canvas(win, width=W, height=H, bg=BG, highlightthickness=0, bd=0)
+    cv.pack()
 
-    tk.Label(win, text=NAME.upper(), font=("Segoe UI", 28, "bold"), fg="#b9a6ff", bg="#14121f").pack(pady=(18, 0))
-    status = tk.Label(win, text="Niezalogowany", font=("Segoe UI", 11), fg="#d8d4ea", bg="#14121f")
-    status.pack(pady=(2, 10))
-    buttons = tk.Frame(win, bg="#14121f")
-    buttons.pack()
-    login_btn = ttk.Button(buttons, text="Zaloguj przez Microsoft")
-    play_btn = ttk.Button(buttons, text="GRAJ", state="disabled")
-    login_btn.grid(row=0, column=0, padx=6)
-    play_btn.grid(row=0, column=1, padx=6)
-    bar = ttk.Progressbar(win, mode="determinate", length=500)
-    bar.pack(pady=12)
-    logbox = tk.Text(win, height=11, bg="#0d0c15", fg="#c9c5dc", relief="flat", font=("Consolas", 9))
-    logbox.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+    # --- naglowek z zorza
+    try:
+        rows = render_aurora(W, HEADER)
+        win.aurora = tk.PhotoImage(width=W, height=HEADER)  # referencja, zeby obraz nie zniknal
+        win.aurora.put(" ".join("{" + " ".join(r) + "}" for r in rows))
+        cv.create_image(0, 0, image=win.aurora, anchor="nw")
+    except tk.TclError:
+        pass  # bez obrazu zostaje samo ciemne tlo
+    cv.create_text(W // 2 + 2, 98, text="Z O R Z A", font=font(58, "bold"), fill="#05060f")
+    cv.create_text(W // 2, 96, text="Z O R Z A", font=font(58, "bold"), fill="#ffffff")
+    cv.create_text(W // 2, 148, text="C  L  I  E  N  T", font=font(15), fill="#b8f5da")
+
+    # --- stan konta i kod logowania
+    status = cv.create_text(W // 2, 276, text="●  Niezalogowany", font=font(15), fill=MUTED)
+    code_text = cv.create_text(W // 2, 312, text="", font=("Consolas", -30, "bold"), fill=GREEN)
+    hint = cv.create_text(W // 2, 342, text="", font=font(12), fill=MUTED)
+
+    # --- glowny przycisk
+    BX, BY, BW, BH = W // 2, 392, 300, 58
+    btn_shape = cv.create_polygon(round_points(BX - BW / 2, BY - BH / 2, BX + BW / 2, BY + BH / 2, 16),
+                                  smooth=True, fill=GREEN, outline="", tags="btn")
+    btn_label = cv.create_text(BX, BY, text="ZALOGUJ PRZEZ MICROSOFT", font=font(17, "bold"),
+                               fill="#06281b", tags="btn")
+    logout = cv.create_text(W // 2, 438, text="", font=font(12, "underline"), fill=MUTED, tags="logout")
+
+    # --- pasek postepu i etap
+    PX0, PX1, PY = 120, W - 120, 470
+    cv.create_polygon(round_points(PX0, PY - 3, PX1, PY + 3, 3), smooth=True, fill=OFF, outline="")
+    bar = cv.create_rectangle(PX0, PY - 3, PX0, PY + 3, fill=GREEN, outline="")
+    stage = cv.create_text(W // 2, 490, text="", font=font(12), fill=MUTED, width=W - 160)
+
+    # --- log
+    logbox = tk.Text(win, bg=PANEL, fg="#aab2d5", relief="flat", bd=0, padx=10, pady=8, wrap="none",
+                     font=("Consolas", -12), insertbackground="#aab2d5", highlightthickness=1,
+                     highlightbackground="#1c2040", highlightcolor="#1c2040")
+    cv.create_window(20, 512, window=logbox, anchor="nw", width=W - 40, height=96)
+    version_label = "najnowsza" if cfg["game_version"] == "latest" else cfg["game_version"]
+    cv.create_text(20, H - 14, anchor="w", font=font(11), fill="#565d80",
+                   text=f"Minecraft {version_label}" + (" + Fabric" if cfg.get("use_fabric") else ""))
+    cv.create_text(W - 20, H - 14, anchor="e", font=font(11), fill="#565d80", text=f"v{VERSION}")
+
+    def set_button(text=None, enabled=None):
+        if text is not None:
+            cv.itemconfig(btn_label, text=text)
+        if enabled is not None:
+            state["btn_on"] = enabled
+            cv.itemconfig(btn_shape, fill=GREEN if enabled else OFF)
+            cv.itemconfig(btn_label, fill="#06281b" if enabled else "#6b7294")
+
+    def set_stage(msg, error=False):
+        cv.itemconfig(stage, text=msg[:160], fill=RED if error else MUTED)
+
+    def write_log(msg):
+        logbox.insert("end", msg + "\n")
+        logbox.see("end")
 
     def log(msg):
-        events.put(("log", str(msg)))
+        events.put(("stage", str(msg)))
 
     def progress(done, total):
         events.put(("progress", done, total))
 
-    def worker(fn):
+    def worker(fn, busy_text):
         def run():
             try:
                 fn()
             except LauncherError as e:
-                log(f"BLAD: {e}")
+                events.put(("error", str(e)))
             except Exception as e:  # siec, nieoczekiwane odpowiedzi API
-                log(f"BLAD ({type(e).__name__}): {e}")
+                events.put(("error", f"{type(e).__name__}: {e}"))
             finally:
                 events.put(("idle",))
         state["busy"] = True
-        login_btn.config(state="disabled")
-        play_btn.config(state="disabled")
+        set_button(busy_text, False)
         threading.Thread(target=run, daemon=True).start()
 
     def do_login():
         def show(code, uri):
-            log(f"Otwieram {uri} - wpisz tam kod: {code}")
-            events.put(("code", code))
+            events.put(("code", code, uri))
             webbrowser.open(uri)
         account = MicrosoftAuth(cfg["msa_client_id"]).login(show)
         state["account"] = account
@@ -544,40 +640,91 @@ def run_gui():
 
     def do_play():
         proc = prepare_and_launch(cfg, state["account"], log, progress)
+        events.put(("stage", "Gra uruchomiona"))
+        events.put(("ingame",))
         for line in proc.stdout:
-            log(line.rstrip())
-        log(f"Gra zakonczona (kod {proc.wait()})")
+            events.put(("gamelog", line.rstrip()))
+        events.put(("stage", f"Gra zakończona (kod {proc.wait()})"))
 
-    login_btn.config(command=lambda: worker(do_login))
-    play_btn.config(command=lambda: worker(do_play))
+    def on_click(_event=None):
+        if state["busy"] or not state.get("btn_on", True):
+            return
+        if state["account"]:
+            worker(do_play, "URUCHAMIANIE…")
+        else:
+            worker(do_login, "LOGOWANIE…")
+
+    def on_logout(_event=None):
+        if state["busy"] or not state["account"]:
+            return
+        try:
+            AUTH_FILE.unlink()
+        except OSError:
+            pass
+        state["account"] = None
+        cv.itemconfig(status, text="●  Niezalogowany", fill=MUTED)
+        cv.itemconfig(logout, text="")
+        set_button("ZALOGUJ PRZEZ MICROSOFT", True)
+        set_stage("Wylogowano")
+
+    def hover(on):
+        if state.get("btn_on", True) and not state["busy"]:
+            cv.itemconfig(btn_shape, fill=GREEN_HI if on else GREEN)
+            cv.config(cursor="hand2" if on else "")
+
+    cv.tag_bind("btn", "<Button-1>", on_click)
+    cv.tag_bind("btn", "<Enter>", lambda e: hover(True))
+    cv.tag_bind("btn", "<Leave>", lambda e: hover(False))
+    cv.tag_bind("logout", "<Button-1>", on_logout)
+    cv.tag_bind("logout", "<Enter>", lambda e: cv.config(cursor="hand2"))
+    cv.tag_bind("logout", "<Leave>", lambda e: cv.config(cursor=""))
+    win.bind("<Return>", on_click)
 
     def pump():
         try:
             while True:
                 ev = events.get_nowait()
-                if ev[0] == "log":
-                    logbox.insert("end", ev[1] + "\n")
-                    logbox.see("end")
-                elif ev[0] == "progress":
-                    bar.config(maximum=ev[2], value=ev[1])
-                elif ev[0] == "code":
-                    status.config(text=f"Kod logowania: {ev[1]}")
+                kind = ev[0]
+                if kind == "stage":
+                    set_stage(ev[1])
+                    write_log(ev[1])
+                elif kind == "gamelog":
+                    write_log(ev[1])
+                elif kind == "error":
+                    set_stage("Błąd: " + ev[1].splitlines()[0], error=True)
+                    write_log("BŁĄD: " + ev[1])
+                    cv.itemconfig(code_text, text="")
+                    cv.itemconfig(hint, text="")
+                elif kind == "progress":
+                    frac = ev[1] / ev[2] if ev[2] else 0
+                    cv.coords(bar, PX0, PY - 3, PX0 + (PX1 - PX0) * frac, PY + 3)
+                elif kind == "code":
+                    cv.itemconfig(code_text, text=ev[1])
+                    cv.itemconfig(hint, text=f"Wpisz ten kod na {ev[2]} (jest już w schowku)")
+                    write_log(f"Kod logowania: {ev[1]}  ->  {ev[2]}")
                     win.clipboard_clear()
                     win.clipboard_append(ev[1])
-                elif ev[0] == "account":
-                    status.config(text=f"Zalogowano: {ev[1]}")
-                elif ev[0] == "idle":
+                elif kind == "account":
+                    cv.itemconfig(status, text=f"●  Zalogowano: {ev[1]}", fill=GREEN)
+                    cv.itemconfig(code_text, text="")
+                    cv.itemconfig(hint, text="")
+                    cv.itemconfig(logout, text="Wyloguj")
+                    set_stage("Gotowe do gry")
+                elif kind == "ingame":
+                    cv.coords(bar, PX0, PY - 3, PX1, PY + 3)
+                    set_button("W GRZE", False)
+                elif kind == "idle":
                     state["busy"] = False
-                    login_btn.config(state="normal")
-                    play_btn.config(state="normal" if state["account"] else "disabled")
+                    cv.coords(bar, PX0, PY - 3, PX0, PY + 3)
+                    set_button("GRAJ" if state["account"] else "ZALOGUJ PRZEZ MICROSOFT", True)
         except queue.Empty:
             pass
         win.after(100, pump)
 
-    log(f"Folder launchera: {ROOT}")
-    log(f"Mody wrzucaj do: {GAME_DIR / 'mods'}")
+    write_log(f"Folder launchera: {ROOT}")
+    write_log(f"Mody wrzucaj do: {GAME_DIR / 'mods'}")
     if AUTH_FILE.exists() and cfg["msa_client_id"]:
-        worker(do_login)  # ciche odswiezenie zapisanej sesji
+        worker(do_login, "LOGOWANIE…")  # ciche odswiezenie zapisanej sesji
     pump()
     win.mainloop()
 
