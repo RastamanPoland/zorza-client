@@ -680,7 +680,8 @@ def modrinth_search(query: str, game_version: str, limit: int = 30, offset: int 
     hits = get_json(f"{MODRINTH}/search?{urllib.parse.urlencode(params)}").get("hits", [])
     return [{"source": "modrinth", "id": h["project_id"], "title": h.get("title", h["project_id"]),
              "description": h.get("description", ""), "downloads": int(h.get("downloads", 0)),
-             "author": h.get("author", "")} for h in hits]
+             "author": h.get("author", ""),
+             "url": f"https://modrinth.com/mod/{h.get('slug') or h['project_id']}"} for h in hits]
 
 
 def modrinth_install(project_id, game_version, game_dir, log=print, title=None, _seen=None) -> None:
@@ -737,7 +738,8 @@ def curseforge_search(query: str, game_version: str, api_key: str, limit: int = 
     data = curseforge_get(f"/mods/search?{urllib.parse.urlencode(params)}", api_key).get("data", [])
     return [{"source": "curseforge", "id": str(m["id"]), "title": m.get("name", str(m["id"])),
              "description": m.get("summary", ""), "downloads": int(m.get("downloadCount", 0)),
-             "author": ((m.get("authors") or [{}])[0] or {}).get("name", "")} for m in data]
+             "author": ((m.get("authors") or [{}])[0] or {}).get("name", ""),
+             "url": (m.get("links") or {}).get("websiteUrl", "")} for m in data]
 
 
 def curseforge_install(mod_id, game_version, game_dir, api_key, log=print, title=None, _seen=None) -> None:
@@ -1636,7 +1638,9 @@ def run_gui():
         det_desc = make_label(details, "Wybierz mod z listy.", 13, TEXT, bg=PANEL, wraplength=290)
         det_desc.pack(fill="x", padx=16, pady=(12, 0))
         install_btn = make_button(details, "Zainstaluj", lambda: install(), "primary")
-        install_btn.pack(side="bottom", fill="x", padx=16, pady=16, ipady=3)
+        install_btn.pack(side="bottom", fill="x", padx=16, pady=(6, 16), ipady=3)
+        page_btn = make_button(details, "Strona moda", lambda: open_page())
+        page_btn.pack(side="bottom", fill="x", padx=16)
         det_msg = make_label(details, "", 12, MUTED, bg=PANEL, wraplength=290)
         det_msg.pack(side="bottom", fill="x", padx=16)
 
@@ -1654,6 +1658,7 @@ def run_gui():
                 det_meta.config(text="")
                 det_desc.config(text="Wybierz mod z listy.")
                 install_btn.config(text="Zainstaluj", state="disabled")
+                page_btn.config(state="disabled")
                 return
             meta = [f"{format_count(r['downloads'])} pobrań"]
             if r.get("author"):
@@ -1663,6 +1668,12 @@ def run_gui():
             det_desc.config(text=shorten(r.get("description", ""), 400))
             have = (r["source"], str(r["id"])) in installed_keys()
             install_btn.config(text="Zainstaluj ponownie / zaktualizuj" if have else "Zainstaluj", state="normal")
+            page_btn.config(state="normal" if str(r.get("url", "")).startswith("https://") else "disabled")
+
+        def open_page():
+            r = selected()
+            if r and str(r.get("url", "")).startswith("https://"):
+                webbrowser.open(r["url"])
 
         def render():
             have = installed_keys()
