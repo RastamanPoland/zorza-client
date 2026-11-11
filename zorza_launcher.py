@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zorza Client 0.1 - launcher Minecraft: Java Edition z Fabric Loaderem.
+"""Zorza Client - launcher Minecraft: Java Edition z Fabric, Quilt, Forge i NeoForge.
 
 Profile, ustawienia i instalowanie modow z Modrinth oraz CurseForge.
 
@@ -8,7 +8,7 @@ Uruchamianie:   python zorza_launcher.py          (okno)
 
 Wymaga tylko Pythona 3.9+ (biblioteka standardowa). Obsluguje wersje gry
 1.19 i nowsze (w tym 26.x). Pliki gry sa pobierane z serwerow Mojangu,
-Fabric z meta.fabricmc.net. Logowanie wylacznie kontem Microsoft.
+Loadery z ich oficjalnych serwerow. Logowanie wylacznie kontem Microsoft.
 """
 import base64
 import hashlib
@@ -34,12 +34,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 NAME = "Zorza Client"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 UA = f"RastamanPoland/zorza-client/{VERSION} (github.com/RastamanPoland/zorza-client)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 RESOURCES_URL = "https://resources.download.minecraft.net"
 FABRIC_META = "https://meta.fabricmc.net/v2"
+QUILT_META = "https://meta.quiltmc.org/v3"
+FORGE_PROMOS = "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json"
+FORGE_MAVEN = "https://maven.minecraftforge.net/net/minecraftforge/forge"
+NEOFORGE_MAVEN = "https://maven.neoforged.net/releases/net/neoforged/neoforge"
+NEOFORGE_LATEST = "https://maven.neoforged.net/api/maven/latest/version/releases/net/neoforged/neoforge"
+
+LOADERS = ("vanilla", "fabric", "quilt", "forge", "neoforge")
+LOADER_LABELS = {"vanilla": "Vanilla (bez modów)", "fabric": "Fabric", "quilt": "Quilt", "forge": "Forge",
+                 "neoforge": "NeoForge"}
+# jakie mody pasuja do loadera: Quilt uruchamia tez mody Fabric
+MODRINTH_LOADERS = {"fabric": ["fabric"], "quilt": ["quilt", "fabric"], "forge": ["forge"], "neoforge": ["neoforge"]}
+CURSEFORGE_LOADER = {"fabric": 4, "quilt": 4, "forge": 1, "neoforge": 6}
 JAVA_RUNTIMES_URL = ("https://piston-meta.mojang.com/v1/products/java-runtime/"
                      "2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json")
 MSA = "https://login.microsoftonline.com/consumers/oauth2/v2.0"
@@ -83,7 +95,7 @@ def curseforge_key(cfg: dict) -> str:
 DEFAULT_CONFIG = {
     "msa_client_id": "",      # ID aplikacji z Azure (wymaga zgody Mojangu na API)
     "game_version": "latest",  # "latest" albo np. "26.3"
-    "use_fabric": True,
+    "use_fabric": True,       # stare ustawienie; profile maja wlasne pole "loader"
     "memory_mb": 4096,
     "java_path": "",          # puste = pobierz Jave od Mojangu
     "curseforge_api_key": "",  # opcjonalny wlasny klucz; puste = klucz wbudowany
@@ -226,8 +238,90 @@ def lib_key(name: str) -> str:
     return ":".join(parts[:2] + parts[3:4])  # bez wersji: duplikaty nadpisujemy
 
 
-def resolve_version(cfg, log=print) -> dict:
-    """Zwraca scalony opis wersji (vanilla + ewentualnie Fabric)."""
+def cfg_loader(cfg: dict) -> str:
+    loader = cfg.get("loader")
+    if loader in LOADERS:
+        return loader
+    return "fabric" if cfg.get("use_fabric") else "vanilla"
+
+
+def merge_inherited(parent: dict, child: dict) -> dict:
+    """Laczy wersje z "inheritsFrom" (Forge, NeoForge) z wersja vanilla, jak oficjalny launcher."""
+    v = dict(parent)
+    for key in ("mainClass", "javaVersion", "assetIndex", "assets"):
+        if child.get(key):
+            v[key] = child[key]
+    v["libraries"] = list(parent.get("libraries", [])) + list(child.get("libraries", []))
+    v["arguments"] = {k: list(parent.get("arguments", {}).get(k, [])) + list(child.get("arguments", {}).get(k, []))
+                      for k in ("jvm", "game")}
+    return v
+
+
+def neoforge_prefix(mc: str) -> str:
+    """1.21.1 -> '21.1.', 1.21 -> '21.0.', 26.1 -> '26.1.0.', 26.1.2 -> '26.1.2.'"""
+    parts = mc.split(".")
+    if parts[0] == "1":
+        return f"{parts[1]}.{parts[2] if len(parts) > 2 else 0}."
+    return f"{parts[0]}.{parts[1] if len(parts) > 1 else 0}.{parts[2] if len(parts) > 2 else 0}."
+
+
+def forge_like_version(loader: str, mc: str, pin: str = "") -> str:
+    if pin:
+        return pin
+    if loader == "forge":
+        promos = get_json(FORGE_PROMOS).get("promos", {})
+        version = promos.get(f"{mc}-recommended") or promos.get(f"{mc}-latest")
+        if not version:
+            raise LauncherError(f"Forge nie ma jeszcze wersji dla Minecraft {mc}")
+        return version
+    prefix = neoforge_prefix(mc)
+    version = str(get_json(f"{NEOFORGE_LATEST}?{urllib.parse.urlencode({'filter': prefix})}").get("version") or "")
+    if not version.startswith(prefix):
+        raise LauncherError(f"NeoForge nie ma jeszcze wersji dla Minecraft {mc}")
+    return version
+
+
+def install_forge_like(loader: str, mc: str, pin: str, vanilla: dict, cfg: dict, log=print, progress=None):
+    """Uruchamia oficjalny instalator Forge/NeoForge w trybie bez okna. Zwraca (wersja, json wersji)."""
+    label = LOADER_LABELS[loader]
+    version = forge_like_version(loader, mc, pin)
+    if loader == "forge":
+        url = f"{FORGE_MAVEN}/{mc}-{version}/forge-{mc}-{version}-installer.jar"
+    else:
+        url = f"{NEOFORGE_MAVEN}/{version}/neoforge-{version}-installer.jar"
+    installer = ROOT / "cache" / "installers" / url.rsplit("/", 1)[1]
+    log(f"Pobieram instalator {label} {version}…")
+    download(url, installer)
+    try:
+        with zipfile.ZipFile(installer) as zf:
+            vid = json.loads(zf.read("install_profile.json").decode("utf-8")).get("version")
+    except (zipfile.BadZipFile, KeyError, ValueError):
+        installer.unlink(missing_ok=True)
+        raise LauncherError(f"Instalator {label} {version} jest uszkodzony, spróbuj ponownie")
+    if not vid or "/" in vid or "\\" in vid or vid.startswith("."):
+        raise LauncherError(f"Nieoczekiwana nazwa wersji w instalatorze {label}: {vid}")
+    vjson = VERSIONS / vid / f"{vid}.json"
+    if not vjson.exists():
+        profiles = ROOT / "launcher_profiles.json"  # instalator nie dziala bez tego pliku
+        if not profiles.exists():
+            profiles.write_text(json.dumps({"profiles": {}}), "utf-8")
+        java = ensure_java(vanilla, cfg, log, progress)
+        log(f"Instaluję {label} {version}. Za pierwszym razem może to potrwać kilka minut…")
+        flags = 0x08000000 if OS_NAME == "windows" else 0  # bez okna konsoli
+        try:
+            proc = subprocess.run([java, "-jar", str(installer), "--installClient", str(ROOT)],
+                                  cwd=installer.parent, capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=1800, creationflags=flags)
+        except subprocess.TimeoutExpired:
+            raise LauncherError(f"Instalator {label} nie skończył pracy w 30 minut")
+        if proc.returncode != 0 or not vjson.exists():
+            tail = (proc.stdout or "")[-1200:] + (proc.stderr or "")[-600:]
+            raise LauncherError(f"Instalator {label} zakończył się błędem (kod {proc.returncode}):\n{tail.strip()}")
+    return version, json.loads(vjson.read_text("utf-8"))
+
+
+def resolve_version(cfg, log=print, progress=None) -> dict:
+    """Zwraca scalony opis wersji: vanilla plus wybrany loader."""
     manifest = get_json(MANIFEST_URL)
     vid = cfg["game_version"]
     if vid == "latest":
@@ -240,25 +334,33 @@ def resolve_version(cfg, log=print) -> dict:
     v = json.loads(vfile.read_text("utf-8"))
     if "arguments" not in v:
         raise LauncherError("Ta wersja gry jest za stara (obslugiwane 1.19+)")
-    v["_id"], v["_fabric"] = vid, None
-    if cfg.get("use_fabric"):
-        loaders = get_json(f"{FABRIC_META}/versions/loader/{urllib.parse.quote(vid)}")
+    v["_id"], v["_mc"], v["_fabric"], v["_loader"] = vid, vid, None, None
+    loader = cfg_loader(cfg)
+    pin = cfg.get("loader_version") or cfg.get("fabric_loader") or ""
+    if loader in ("fabric", "quilt"):
+        meta, label = (FABRIC_META, "Fabric Loader") if loader == "fabric" else (QUILT_META, "Quilt Loader")
+        loaders = get_json(f"{meta}/versions/loader/{urllib.parse.quote(vid)}")
         if not loaders:
-            raise LauncherError(f"Fabric nie wspiera jeszcze wersji {vid}. "
-                                "Ustaw starsza 'game_version' albo 'use_fabric': false")
-        wanted = cfg.get("fabric_loader")
-        pick = next((l for l in loaders if wanted and l["loader"]["version"] == wanted), None)
-        if wanted and not pick:
-            log(f"Fabric Loader {wanted} nie pasuje do wersji {vid}, używam najnowszego stabilnego")
-        pick = pick or next((l for l in loaders if l["loader"].get("stable")), loaders[0])
+            raise LauncherError(f"{LOADER_LABELS[loader]} nie wspiera jeszcze wersji {vid}. "
+                                "Wybierz starszą wersję gry albo inny loader.")
+        pick = next((l for l in loaders if pin and l["loader"]["version"] == pin), None)
+        if pin and not pick:
+            log(f"{label} {pin} nie pasuje do wersji {vid}, używam najnowszego stabilnego")
+        if loader == "fabric":
+            pick = pick or next((l for l in loaders if l["loader"].get("stable")), loaders[0])
+        else:
+            pick = pick or next((l for l in loaders if not re.search(r"beta|pre|rc", l["loader"]["version"])), loaders[0])
         lv = pick["loader"]["version"]
-        log(f"Fabric Loader {lv}")
-        prof = get_json(f"{FABRIC_META}/versions/loader/{urllib.parse.quote(vid)}/{lv}/profile/json")
-        v["mainClass"] = prof["mainClass"]
-        v["libraries"] = v["libraries"] + prof.get("libraries", [])
-        for kind in ("jvm", "game"):
-            v["arguments"][kind] = v["arguments"].get(kind, []) + prof.get("arguments", {}).get(kind, [])
-        v["_fabric"] = lv
+        log(f"{label} {lv}")
+        prof = get_json(f"{meta}/versions/loader/{urllib.parse.quote(vid)}/{urllib.parse.quote(lv)}/profile/json")
+        v = merge_inherited(v, prof)
+        if loader == "fabric":
+            v["_fabric"] = lv
+        v["_loader"] = (loader, lv)
+    elif loader in ("forge", "neoforge"):
+        version, child = install_forge_like(loader, vid, pin, v, cfg, log, progress)
+        v = merge_inherited(v, child)
+        v["_id"], v["_loader"] = child.get("id") or vid, (loader, version)
     return v
 
 
@@ -266,20 +368,21 @@ def collect_libraries(v):
     """Zwraca (zadania_pobierania, classpath). Pozniejsze wpisy (Fabric) wygrywaja."""
     chosen = {}
     for lib in v["libraries"]:
-        if not rules_allow(lib.get("rules")):
+        if not rules_allow(lib.get("rules")) or "name" not in lib:
             continue
         art = lib.get("downloads", {}).get("artifact")
         if art:
-            path = art.get("path") or maven_path(lib["name"])
-            task = (art["url"], LIBS / path, art.get("sha1"), art.get("size"))
-        elif "url" in lib:  # styl Fabrica: nazwa + adres repozytorium
-            path = maven_path(lib["name"])
-            task = (lib["url"].rstrip("/") + "/" + path, LIBS / path, lib.get("sha1"), lib.get("size"))
+            path = LIBS / (art.get("path") or maven_path(lib["name"]))
+            task = (art["url"], path, art.get("sha1"), art.get("size")) if art.get("url") else None
+        elif lib.get("url"):  # styl Fabrica: nazwa + adres repozytorium
+            path = LIBS / maven_path(lib["name"])
+            task = (lib["url"].rstrip("/") + "/" + maven_path(lib["name"]), path, lib.get("sha1"), lib.get("size"))
+        elif "downloads" in lib:
+            continue  # tylko natywne pliki starego typu
         else:
-            continue
-        chosen[lib_key(lib["name"])] = task
-    tasks = list(chosen.values())
-    return tasks, [t[1] for t in tasks]
+            path, task = LIBS / maven_path(lib["name"]), None  # plik utworzony przez instalator
+        chosen[lib_key(lib["name"])] = (task, path)
+    return [t for t, _ in chosen.values() if t], [p for _, p in chosen.values()]
 
 
 def collect_assets(v):
@@ -476,14 +579,19 @@ def prepare_and_launch(cfg, account, log=print, progress=None, game_dir=None) ->
     for d in (LIBS, ASSETS, VERSIONS, RUNTIMES, game_dir / "mods"):
         d.mkdir(parents=True, exist_ok=True)
     log("Sprawdzam wersję…")
-    v = resolve_version(cfg, log)
-    vid = v["_id"]
-    log(f"Minecraft {vid}" + (" + Fabric" if v["_fabric"] else ""))
+    v = resolve_version(cfg, log, progress)
+    vid, mc = v["_id"], v.get("_mc", v["_id"])
+    log(f"Minecraft {mc}" + (f" + {LOADER_LABELS[v['_loader'][0]]} {v['_loader'][1]}" if v.get("_loader") else ""))
     lib_tasks, classpath = collect_libraries(v)
     client = v["downloads"]["client"]
-    client_task = (client["url"], VERSIONS / vid / f"{vid}.jar", client.get("sha1"), client.get("size"))
+    client_task = (client["url"], VERSIONS / mc / f"{mc}.jar", client.get("sha1"), client.get("size"))
     log("Pobieram biblioteki i grę…")
     download_all(lib_tasks + [client_task], progress)
+    missing = [p for p in classpath if not p.exists()]
+    if missing:
+        raise LauncherError(f"Brakuje biblioteki {missing[0].name}. Usuń folder versions/{vid} i spróbuj ponownie.")
+    if vid != mc and not (VERSIONS / vid / f"{vid}.jar").exists():
+        shutil.copyfile(VERSIONS / mc / f"{mc}.jar", VERSIONS / vid / f"{vid}.jar")  # jak oficjalny launcher
     log("Pobieram zasoby…")
     download_all(collect_assets(v), progress, workers=16)
     java = ensure_java(v, cfg, log, progress)
@@ -539,7 +647,7 @@ def save_profiles(data: dict) -> None:
 
 
 def load_profiles(cfg: dict = None) -> dict:
-    """Profil = osobny folder gry (mody, swiaty, ustawienia) + wersja + Fabric."""
+    """Profil = osobny folder gry (mody, swiaty, ustawienia) + wersja + loader."""
     data = None
     if PROFILES_FILE.exists():
         try:
@@ -551,8 +659,21 @@ def load_profiles(cfg: dict = None) -> dict:
         data = {"selected": "default", "profiles": {"default": {
             "name": "Domyślny",
             "game_version": cfg.get("game_version", "latest"),
-            "use_fabric": bool(cfg.get("use_fabric", True)),
+            "loader": cfg_loader(dict(cfg, use_fabric=cfg.get("use_fabric", True))),
         }}}
+        save_profiles(data)
+    changed = False
+    for p in data["profiles"].values():  # profile z wersji 0.4 i starszych
+        if p.get("loader") not in LOADERS:
+            p["loader"] = "fabric" if p.get("use_fabric", True) else "vanilla"
+            changed = True
+        if "use_fabric" in p:
+            p.pop("use_fabric")
+            changed = True
+        if p.get("fabric_loader"):
+            p["loader_version"] = p.pop("fabric_loader")
+            changed = True
+    if changed:
         save_profiles(data)
     if data.get("selected") not in data["profiles"]:
         data["selected"] = next(iter(data["profiles"]))
@@ -698,9 +819,11 @@ def _store_mod(game_dir, url, filename, sha1, size, source, project_id, title, v
                 source, project_id, title, version)
 
 
-def modrinth_search(query: str, game_version: str, limit: int = 30, offset: int = 0, sort: str = None) -> list:
+def modrinth_search(query: str, game_version: str, limit: int = 30, offset: int = 0, sort: str = None,
+                    loader: str = "fabric") -> list:
     """Bez zapytania zwraca najpopularniejsze mody (sortowanie po liczbie pobran)."""
-    facets = [["project_type:mod"], ["categories:fabric"]] + ([[f"versions:{game_version}"]] if game_version else [])
+    facets = [["project_type:mod"], [f"categories:{x}" for x in MODRINTH_LOADERS[loader]]]
+    facets += [[f"versions:{game_version}"]] if game_version else []
     params = {"limit": limit, "offset": offset, "facets": json.dumps(facets),
               "index": sort or ("relevance" if query else "downloads")}
     if query:
@@ -709,19 +832,19 @@ def modrinth_search(query: str, game_version: str, limit: int = 30, offset: int 
     return [_modrinth_hit(h, "mod") for h in hits]
 
 
-def modrinth_install(project_id, game_version, game_dir, log=print, title=None, _seen=None) -> None:
+def modrinth_install(project_id, game_version, game_dir, log=print, title=None, _seen=None, loader="fabric") -> None:
     seen = _seen if _seen is not None else set()
     if project_id in seen:
         return
     seen.add(project_id)
     pid = urllib.parse.quote(str(project_id), safe="")
-    query = urllib.parse.urlencode({"loaders": json.dumps(["fabric"]),
+    query = urllib.parse.urlencode({"loaders": json.dumps(MODRINTH_LOADERS[loader]),
                                     "game_versions": json.dumps([game_version])})
     versions = get_json(f"{MODRINTH}/project/{pid}/version?{query}")
     if title is None:
         title = get_json(f"{MODRINTH}/project/{pid}").get("title", str(project_id))
     if not versions:
-        raise LauncherError(f"„{title}” nie ma wersji dla Minecraft {game_version} z Fabric")
+        raise LauncherError(f"„{title}” nie ma wersji dla Minecraft {game_version} z {LOADER_LABELS[loader]}")
     ver = versions[0]
     files = ver.get("files") or []
     if not files:
@@ -738,7 +861,7 @@ def modrinth_install(project_id, game_version, game_dir, log=print, title=None, 
             vid = urllib.parse.quote(str(dep["version_id"]), safe="")
             dep_id = get_json(f"{MODRINTH}/version/{vid}").get("project_id")
         if dep_id:
-            modrinth_install(dep_id, game_version, game_dir, log, None, seen)
+            modrinth_install(dep_id, game_version, game_dir, log, None, seen, loader)
 
 
 def curseforge_get(path: str, api_key: str):
@@ -764,7 +887,8 @@ def curseforge_search(query: str, game_version: str, api_key: str, limit: int = 
     return [_curseforge_hit(m) for m in data]
 
 
-def curseforge_install(mod_id, game_version, game_dir, api_key, log=print, title=None, _seen=None) -> None:
+def curseforge_install(mod_id, game_version, game_dir, api_key, log=print, title=None, _seen=None,
+                       loader="fabric") -> None:
     seen = _seen if _seen is not None else set()
     mod_id = int(mod_id)
     if mod_id in seen:
@@ -772,10 +896,11 @@ def curseforge_install(mod_id, game_version, game_dir, api_key, log=print, title
     seen.add(mod_id)
     if title is None:
         title = curseforge_get(f"/mods/{mod_id}", api_key).get("data", {}).get("name", str(mod_id))
-    query = urllib.parse.urlencode({"gameVersion": game_version, "modLoaderType": 4, "pageSize": 20})
+    query = urllib.parse.urlencode({"gameVersion": game_version, "modLoaderType": CURSEFORGE_LOADER[loader],
+                                    "pageSize": 20})
     files = curseforge_get(f"/mods/{mod_id}/files?{query}", api_key).get("data", [])
     if not files:
-        raise LauncherError(f"„{title}” nie ma wersji dla Minecraft {game_version} z Fabric")
+        raise LauncherError(f"„{title}” nie ma wersji dla Minecraft {game_version} z {LOADER_LABELS[loader]}")
     f = sorted(files, key=lambda x: x.get("fileDate", ""), reverse=True)[0]
     if not f.get("downloadUrl"):
         raise LauncherError(f"Autor „{title}” nie pozwala pobierać moda przez zewnętrzne launchery. "
@@ -786,14 +911,17 @@ def curseforge_install(mod_id, game_version, game_dir, api_key, log=print, title
     log(title)
     for dep in f.get("dependencies", []):
         if dep.get("relationType") == 3 and dep.get("modId"):  # 3 = wymagana zaleznosc
-            curseforge_install(dep["modId"], game_version, game_dir, api_key, log, None, seen)
+            curseforge_install(dep["modId"], game_version, game_dir, api_key, log, None, seen, loader)
 
 
-def install_mod(hit: dict, game_version: str, game_dir: Path, curseforge_key: str = "", log=print) -> None:
+def install_mod(hit: dict, game_version: str, game_dir: Path, curseforge_key: str = "", log=print,
+                loader: str = "fabric") -> None:
+    if loader not in MODRINTH_LOADERS:
+        raise LauncherError("Ten profil nie ma loadera modów. Wybierz Fabric, Quilt, Forge albo NeoForge.")
     if hit["source"] == "curseforge":
-        curseforge_install(hit["id"], game_version, game_dir, curseforge_key, log, hit.get("title"))
+        curseforge_install(hit["id"], game_version, game_dir, curseforge_key, log, hit.get("title"), None, loader)
     else:
-        modrinth_install(hit["id"], game_version, game_dir, log, hit.get("title"))
+        modrinth_install(hit["id"], game_version, game_dir, log, hit.get("title"), None, loader)
 
 
 # ------------------------------------------------- typy tresci, szczegoly, modpacki
@@ -801,8 +929,9 @@ def install_mod(hit: dict, game_version: str, game_dir: Path, curseforge_key: st
 CONTENT_TYPES = {
     "mod": {"label": "Mody", "mr": [["project_type:mod"], ["categories:fabric"]], "mr_loaders": ["fabric"],
             "cf_slug": "mc-mods", "cf_class": 6, "cf_loader": 4},
-    "modpack": {"label": "Modpacki", "mr": [["project_type:modpack"], ["categories:fabric"]],
-                "mr_loaders": ["fabric"], "cf_slug": "modpacks", "cf_class": 4471, "cf_loader": 4},
+    "modpack": {"label": "Modpacki", "mr": [["project_type:modpack"]],
+                "mr_loaders": ["fabric", "quilt", "forge", "neoforge"], "cf_slug": "modpacks", "cf_class": 4471,
+                "cf_loader": None},
     "resourcepack": {"label": "Paczki zasobów", "mr": [["project_type:resourcepack"]], "mr_loaders": ["minecraft"],
                      "cf_slug": "texture-packs", "cf_class": 12, "cf_loader": None},
     "datapack": {"label": "Paczki danych", "mr": [["categories:datapack"]], "mr_loaders": ["datapack"],
@@ -835,12 +964,15 @@ def curseforge_class_id(kind: str, api_key: str) -> int:
     return _cf_classes[t["cf_slug"]]
 
 
-def search_content(kind, source, query, game_version, api_key="", limit=30, offset=0, sort=None) -> list:
-    """Wyszukiwanie dowolnego typu tresci. Modpacki nie sa filtrowane po wersji gry."""
+def search_content(kind, source, query, game_version, api_key="", limit=30, offset=0, sort=None,
+                   loader="fabric") -> list:
+    """Wyszukiwanie dowolnego typu tresci. Modpacki nie sa filtrowane po wersji gry ani loaderze."""
     version = None if kind == "modpack" else game_version
+    if kind == "mod" and loader not in MODRINTH_LOADERS:
+        raise LauncherError("Ten profil nie ma loadera modów. Wybierz go w edycji profilu.")
     if source == "modrinth":
         if kind == "mod":
-            return modrinth_search(query, version, limit, offset, sort)
+            return modrinth_search(query, version, limit, offset, sort, loader)
         facets = [list(f) for f in CONTENT_TYPES[kind]["mr"]] + ([[f"versions:{version}"]] if version else [])
         params = {"limit": limit, "offset": offset, "facets": json.dumps(facets),
                   "index": sort or ("relevance" if query else "downloads")}
@@ -850,7 +982,9 @@ def search_content(kind, source, query, game_version, api_key="", limit=30, offs
         return [_modrinth_hit(h, kind) for h in hits]
     t = CONTENT_TYPES[kind]
     params = {"gameId": 432, "classId": curseforge_class_id(kind, api_key), "pageSize": limit, "index": offset}
-    if t["cf_loader"]:
+    if kind == "mod":
+        params["modLoaderType"] = CURSEFORGE_LOADER[loader]
+    elif t["cf_loader"]:
         params["modLoaderType"] = t["cf_loader"]
     if version:
         params["gameVersion"] = version
@@ -906,7 +1040,8 @@ def project_details(hit: dict, api_key: str = "") -> dict:
         links = [("Strona projektu", hit.get("url")), ("Kod źródłowy", p.get("source_url")),
                  ("Zgłoś błąd", p.get("issues_url")), ("Wiki", p.get("wiki_url")), ("Discord", p.get("discord_url"))]
         return {"description": plain_text(p.get("body") or p.get("description", "")),
-                "categories": [c for c in p.get("categories", []) if c not in ("fabric", "datapack", "minecraft")],
+                "categories": [c for c in p.get("categories", [])
+                               if c not in ("fabric", "quilt", "forge", "neoforge", "datapack", "minecraft")],
                 "updated": str(p.get("updated") or "")[:10], "license": lic.get("name") or lic.get("id") or "",
                 "followers": p.get("followers"),
                 "links": [(label, url) for label, url in links if str(url or "").startswith("https://")]}
@@ -970,9 +1105,12 @@ def _install_mrpack(zf, game_dir, progress=None) -> dict:
     deps = index.get("dependencies") or {}
     if not deps.get("minecraft"):
         raise LauncherError("Modpack nie podaje wersji Minecrafta")
-    for other, label in (("forge", "Forge"), ("neoforge", "NeoForge"), ("quilt-loader", "Quilt")):
-        if other in deps:
-            raise LauncherError(f"Ten modpack wymaga {label}, a Zorza obsługuje tylko Fabric")
+    loader, loader_version = "vanilla", ""
+    for key, name in (("fabric-loader", "fabric"), ("quilt-loader", "quilt"), ("forge", "forge"),
+                      ("neoforge", "neoforge")):
+        if deps.get(key):
+            loader, loader_version = name, str(deps[key])
+            break
     tasks = []
     for f in index.get("files", []):
         if (f.get("env") or {}).get("client") == "unsupported":
@@ -985,19 +1123,24 @@ def _install_mrpack(zf, game_dir, progress=None) -> dict:
     _extract_overrides(zf, "overrides", game_dir)
     _extract_overrides(zf, "client-overrides", game_dir)
     return {"name": index.get("name") or "Modpack", "game_version": deps["minecraft"],
-            "fabric_loader": deps.get("fabric-loader", ""), "version": index.get("versionId", ""),
+            "loader": loader, "loader_version": loader_version, "version": index.get("versionId", ""),
             "files": len(tasks), "blocked": []}
 
 
 def _install_cf_manifest(zf, game_dir, api_key, progress=None) -> dict:
     m = json.loads(zf.read("manifest.json").decode("utf-8"))
     mc = (m.get("minecraft") or {}).get("version")
-    loaders = [str(x.get("id", "")) for x in (m.get("minecraft") or {}).get("modLoaders", [])]
-    fabric = next((x.split("-", 1)[1] for x in loaders if x.startswith("fabric-")), "")
+    entries = (m.get("minecraft") or {}).get("modLoaders", [])
+    primary = next((x for x in entries if x.get("primary")), entries[0] if entries else {})
+    loader_id = str(primary.get("id", ""))
     if not mc:
         raise LauncherError("Modpack nie podaje wersji Minecrafta")
-    if loaders and not fabric:
-        raise LauncherError(f"Ten modpack wymaga {loaders[0]}, a Zorza obsługuje tylko Fabric")
+    loader, loader_version = "vanilla", ""
+    if loader_id:
+        name, _, loader_version = loader_id.partition("-")
+        if name not in MODRINTH_LOADERS:
+            raise LauncherError(f"Ten modpack wymaga loadera {loader_id}, którego Zorza nie obsługuje")
+        loader = name
     file_ids = [int(f["fileID"]) for f in m.get("files", []) if f.get("required", True)]
     files = curseforge_post("/mods/files", {"fileIds": file_ids}, api_key).get("data", []) if file_ids else []
     mod_ids = sorted({f["modId"] for f in files})
@@ -1016,7 +1159,7 @@ def _install_cf_manifest(zf, game_dir, api_key, progress=None) -> dict:
         tasks.append((f["downloadUrl"], game_dir / folder / name, sha1, f.get("fileLength")))
     download_all(tasks, progress)
     _extract_overrides(zf, m.get("overrides") or "overrides", game_dir)
-    return {"name": m.get("name") or "Modpack", "game_version": mc, "fabric_loader": fabric,
+    return {"name": m.get("name") or "Modpack", "game_version": mc, "loader": loader, "loader_version": loader_version,
             "version": m.get("version", ""), "files": len(tasks), "blocked": blocked,
             "missing": max(0, len(file_ids) - len(files))}
 
@@ -1067,15 +1210,15 @@ def install_modpack(hit: dict, game_dir: Path, api_key: str = "", progress=None)
     title = hit.get("title", str(hit["id"]))
     cache = ROOT / "cache"
     if hit["source"] == "modrinth":
-        ver = modrinth_pick(hit["id"], ["fabric"])
+        ver = modrinth_pick(hit["id"], CONTENT_TYPES["modpack"]["mr_loaders"])
         if not ver:
-            raise LauncherError(f"„{title}” nie ma wersji z Fabric")
+            raise LauncherError(f"„{title}” nie ma wersji do pobrania")
         f = _primary_file(ver, title)
         url, name, sha1, size = f["url"], safe_file_name(f["filename"], (".mrpack",)), f.get("hashes", {}).get("sha1"), f.get("size")
     else:
-        f = curseforge_pick_file(hit["id"], None, 4, api_key)
+        f = curseforge_pick_file(hit["id"], None, None, api_key)
         if not f:
-            raise LauncherError(f"„{title}” nie ma wersji z Fabric")
+            raise LauncherError(f"„{title}” nie ma wersji do pobrania")
         if not f.get("downloadUrl"):
             raise LauncherError(f"Autor „{title}” nie pozwala pobierać modpacka przez zewnętrzne launchery.")
         url, name, size = f["downloadUrl"], safe_file_name(f["fileName"], (".zip",)), f.get("fileLength")
@@ -1181,9 +1324,12 @@ def tile_color(key: str) -> str:
 
 def launch_settings(cfg: dict, profile: dict) -> dict:
     """Ustawienia globalne nadpisane ustawieniami profilu."""
-    return dict(cfg, game_version=profile["game_version"], use_fabric=bool(profile.get("use_fabric", True)),
+    loader = profile.get("loader") if profile.get("loader") in LOADERS else (
+        "fabric" if profile.get("use_fabric", True) else "vanilla")
+    return dict(cfg, game_version=profile["game_version"], loader=loader,
+                loader_version=profile.get("loader_version") or profile.get("fabric_loader", ""),
                 memory_mb=int(profile.get("memory_mb") or cfg.get("memory_mb", 4096)),
-                jvm_args=profile.get("jvm_args", ""), fabric_loader=profile.get("fabric_loader", ""))
+                jvm_args=profile.get("jvm_args", ""))
 
 
 # ---------------------------------------------------------------- interfejsy
@@ -1383,7 +1529,16 @@ def run_gui():
 
     def version_label(p):
         version = "najnowsza" if p["game_version"] == "latest" else p["game_version"]
-        return f"Minecraft {version}" + (" · Fabric" if p.get("use_fabric", True) else "")
+        loader = p.get("loader", "fabric")
+        return f"Minecraft {version}" + (f" · {LOADER_LABELS[loader]}" if loader in MODRINTH_LOADERS else "")
+
+    def has_mods(p):
+        return p.get("loader", "fabric") in MODRINTH_LOADERS
+
+    loader_names = [LOADER_LABELS[x] for x in LOADERS]
+
+    def loader_from_label(label):
+        return next((k for k, v in LOADER_LABELS.items() if v == label), "vanilla")
 
     def is_active(pid):
         return state["preparing"] == pid or bool(state["running"] and state["running"]["pid"] == pid)
@@ -1508,7 +1663,7 @@ def run_gui():
         side_icon.create_text(42, 42, text=(p["name"][:1] or "?").upper(), font=font(36, "bold"), fill=BG)
         side_name.config(text=shorten(p["name"], 22))
         side_ver.config(text=version_label(p))
-        side_mods.config(text=plural_mods(len(list_installed(profile_dir(pid)))) if p.get("use_fabric", True)
+        side_mods.config(text=plural_mods(len(list_installed(profile_dir(pid)))) if has_mods(p)
                          else "bez modów")
         busy = state["preparing"] is not None or state["running"] is not None
         play_btn.config(state="disabled" if busy else "normal",
@@ -1706,17 +1861,19 @@ def run_gui():
 
     # ================================================================== profile
     def add_profile_dialog():
-        d = make_dialog("Dodaj profil", 480, 290)
+        d = make_dialog("Dodaj profil", 480, 300)
         f = tk.Frame(d, bg=BG)
         f.pack(fill="both", expand=True, padx=24, pady=18)
         f.columnconfigure(1, weight=1)
         make_label(f, "Nowy profil", 18, bold=True).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        name_e, ver_cb, fabric = make_entry(f), make_combobox(f, state["versions"]), tk.BooleanVar(value=True)
+        name_e, ver_cb = make_entry(f), make_combobox(f, state["versions"])
+        loader_cb = make_combobox(f, loader_names, readonly=True)
         name_e.insert(0, f"Profil {len(pdata['profiles']) + 1}")
         ver_cb.set("latest")
+        loader_cb.set(LOADER_LABELS["fabric"])
         form_row(f, 1, "Nazwa", name_e)
         form_row(f, 2, "Wersja gry", ver_cb)
-        make_check(f, "Fabric (wymagany do modów)", fabric).grid(row=3, column=1, sticky="w", pady=4)
+        form_row(f, 3, "Loader modów", loader_cb)
         msg = make_label(f, "", 12, RED)
         msg.grid(row=4, column=0, columnspan=2, sticky="w")
 
@@ -1727,7 +1884,7 @@ def run_gui():
             if not valid_game_version(version):
                 return msg.config(text="Wersja gry musi mieć postać np. 26.3 albo „latest”.")
             pid = new_profile_id(name, pdata["profiles"])
-            pdata["profiles"][pid] = {"name": name, "game_version": version, "use_fabric": bool(fabric.get())}
+            pdata["profiles"][pid] = {"name": name, "game_version": version, "loader": loader_from_label(loader_cb.get())}
             pdata["selected"] = pid
             save_profiles(pdata)
             d.destroy()
@@ -1813,16 +1970,19 @@ def run_gui():
         pv.columnconfigure(1, weight=1)
         make_label(pv, "Wersja", 18, bold=True).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         name_e, ver_cb = make_entry(pv), make_combobox(pv, state["versions"])
-        fabric = tk.BooleanVar(value=bool(p.get("use_fabric", True)))
+        loader_cb, lv_e = make_combobox(pv, loader_names, readonly=True), make_entry(pv)
         name_e.insert(0, p["name"])
         ver_cb.set(p["game_version"])
+        loader_cb.set(LOADER_LABELS[p.get("loader", "fabric")])
+        lv_e.insert(0, p.get("loader_version", ""))
         form_row(pv, 1, "Nazwa", name_e)
         form_row(pv, 2, "Wersja gry („latest” = najnowsza)", ver_cb)
-        make_check(pv, "Fabric (wymagany do modów)", fabric).grid(row=3, column=1, sticky="w", pady=4)
-        pv_msg = make_label(pv, "", 12, GREEN)
-        pv_msg.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        make_label(pv, f"Fabric Loader: {p['fabric_loader']} (z modpacka)" if p.get("fabric_loader")
-                   else "Fabric Loader: najnowszy stabilny", 12, MUTED).grid(row=6, column=1, sticky="w", pady=(6, 0))
+        form_row(pv, 3, "Loader modów", loader_cb)
+        form_row(pv, 4, "Wersja loadera (puste = najnowsza)", lv_e)
+        pv_msg = make_label(pv, "", 12, GREEN, wraplength=520)
+        pv_msg.grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        make_label(pv, "Forge i NeoForge instalują się przy pierwszym uruchomieniu (kilka minut).", 12, MUTED,
+                   wraplength=520).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         def save_version():
             name, version = name_e.get().strip()[:40], ver_cb.get().strip() or "latest"
@@ -1832,14 +1992,26 @@ def run_gui():
                 return pv_msg.config(text="Nazwa profilu nie może być pusta.", fg=RED)
             if not valid_game_version(version):
                 return pv_msg.config(text="Wersja gry musi mieć postać np. 26.3 albo „latest”.", fg=RED)
-            p.update(name=name, game_version=version, use_fabric=bool(fabric.get()))
+            loader, pin = loader_from_label(loader_cb.get()), lv_e.get().strip()[:60]
+            if pin and not re.fullmatch(r"[0-9A-Za-z.+_-]+", pin):
+                return pv_msg.config(text="Wersja loadera może zawierać tylko litery, cyfry i znaki . + _ -", fg=RED)
+            old_loader = p.get("loader", "fabric")
+            if loader != old_loader:
+                pin = "" if pin == p.get("loader_version", "") else pin  # stara wersja nie pasuje do nowego loadera
+            p.update(name=name, game_version=version, loader=loader)
+            if pin and loader != "vanilla":
+                p["loader_version"] = pin
+            else:
+                p.pop("loader_version", None)
+            lv_e.delete(0, "end")
+            lv_e.insert(0, p.get("loader_version", ""))
             save_profiles(pdata)
             d.title(f"Profil – {name}")
             refresh_all()
             refresh_lists()
             pv_msg.config(text="Zapisano.", fg=GREEN)
 
-        make_button(pv, "Zapisz", save_version, "primary").grid(row=4, column=1, sticky="w", pady=(12, 0))
+        make_button(pv, "Zapisz", save_version, "primary").grid(row=5, column=1, sticky="w", pady=(12, 0))
         pages["version"] = pv
 
         # --- Mody
@@ -1859,8 +2031,8 @@ def run_gui():
             for m in rows:
                 label = m["title"] if m["title"] == m["base"] else f"{m['title']}   ·   {m['base']}"
                 mods_lb.insert("end", ("☑  " if m["enabled"] else "☐  ") + label)
-            if not p.get("use_fabric", True):
-                pm_msg.config(text="Ten profil nie ma Fabrica, więc mody nie zostaną wczytane.", fg=RED)
+            if not has_mods(p):
+                pm_msg.config(text="Ten profil nie ma loadera modów, więc mody nie zostaną wczytane.", fg=RED)
             elif not rows:
                 pm_msg.config(text="Brak modów. Kliknij „Pobierz mody…”.", fg=MUTED)
             else:
@@ -2099,9 +2271,9 @@ def run_gui():
             state["modpack_busy"] = False
             set_progress(0)
             name = shorten(info.get("name") or fallback_name, 40)
-            p = {"name": name, "game_version": info["game_version"], "use_fabric": True}
-            if info.get("fabric_loader"):
-                p["fabric_loader"] = info["fabric_loader"]
+            p = {"name": name, "game_version": info["game_version"], "loader": info.get("loader", "fabric")}
+            if info.get("loader_version"):
+                p["loader_version"] = info["loader_version"]
             if pack_meta:
                 p["pack"] = dict(pack_meta, version=info.get("version", ""))
             pdata["profiles"][pid] = p
@@ -2357,8 +2529,8 @@ def run_gui():
             problem = None
             if not p:
                 problem = "Ten profil został usunięty."
-            elif dl["kind"] == "mod" and not p.get("use_fabric", True):
-                problem = "Ten profil nie ma Fabrica. Włącz go w edycji profilu."
+            elif dl["kind"] == "mod" and not has_mods(p):
+                problem = "Ten profil nie ma loadera modów. Wybierz Fabric, Quilt, Forge albo NeoForge w edycji profilu."
             elif dl["source"] == "curseforge" and not curseforge_key(cfg):
                 problem = "Ta wersja nie ma wbudowanego klucza CurseForge. Wpisz własny w Ustawieniach."
             if problem:
@@ -2376,8 +2548,8 @@ def run_gui():
             sort = dict(SORTS).get(sort_cb.get(), "downloads") if src == "modrinth" else None
             if src == "modrinth" and not text and sort == "relevance":
                 sort = "downloads"  # bez zapytania "trafność" nie ma sensu
-            wanted = profile(pid)["game_version"]
-            request_key = (kind, src, wanted, text, sort)
+            wanted, loader = profile(pid)["game_version"], profile(pid).get("loader", "fabric")
+            request_key = (kind, src, wanted, loader, text, sort)
             if more and (dl["key"] != request_key or dl["end"]):
                 return
             if not more and not force and request_key == dl["key"] and dl["results"]:
@@ -2390,7 +2562,7 @@ def run_gui():
 
             def job():
                 version = resolve_game_version(wanted)
-                return version, search_content(kind, src, text, version, key, PAGE, offset, sort)
+                return version, search_content(kind, src, text, version, key, PAGE, offset, sort, loader)
 
             def done(result):
                 if req != dl["req"] or not alive(d):
@@ -2470,7 +2642,7 @@ def run_gui():
                 return
             if is_active(pid):
                 return det_msg.config(text="Zamknij grę przed instalowaniem.", fg=RED)
-            wanted, game_dir = profile(pid)["game_version"], profile_dir(pid)
+            wanted, game_dir, loader = profile(pid)["game_version"], profile_dir(pid), profile(pid).get("loader", "fabric")
 
             def run(target_dir, index_path, where=""):
                 install_btn.config(state="disabled")
@@ -2481,7 +2653,7 @@ def run_gui():
                     version = resolve_game_version(wanted)
                     try:
                         if kind == "mod":
-                            install_mod(r, version, game_dir, key, names.append)
+                            install_mod(r, version, game_dir, key, names.append, loader)
                         else:
                             install_pack(r, kind, version, target_dir, index_path, key, names.append)
                     except LauncherError as e:
