@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 NAME = "Zorza Client"
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 UA = f"RastamanPoland/zorza-client/{VERSION} (github.com/RastamanPoland/zorza-client)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -86,6 +86,16 @@ try:  # klucz CurseForge trzymany w osobnym pliku, ktory nie trafia do repozytor
     from zorza_secrets import CURSEFORGE_API_KEY as BUILTIN_CURSEFORGE_KEY
 except ImportError:
     BUILTIN_CURSEFORGE_KEY = ""
+
+
+_cdn_key = {"value": ""}  # klucz CurseForge do pobierania plikow z ich CDN (wymagany od lipca 2026)
+
+
+def cdn_headers(url: str) -> dict:
+    host = urllib.parse.urlparse(url).hostname or ""
+    if _cdn_key["value"] and (host == "forgecdn.net" or host.endswith(".forgecdn.net")):
+        return {"x-api-key": _cdn_key["value"]}
+    return {}
 
 
 def curseforge_key(cfg: dict) -> str:
@@ -168,7 +178,7 @@ def download(url: str, dest: Path, sha1: str = None, size: int = None) -> None:
     last = None
     for attempt in range(3):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            req = urllib.request.Request(url, headers=dict(cdn_headers(url), **{"User-Agent": UA}))
             with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
                 shutil.copyfileobj(r, f)
             if sha1 and sha1_of(tmp) != sha1:
@@ -867,6 +877,7 @@ def modrinth_install(project_id, game_version, game_dir, log=print, title=None, 
 def curseforge_get(path: str, api_key: str):
     if not api_key:
         raise LauncherError("Brak klucza API CurseForge. Wpisz go w Ustawieniach.")
+    _cdn_key["value"] = api_key
     try:
         return get_json(CURSEFORGE + path, headers={"x-api-key": api_key})
     except urllib.error.HTTPError as e:
@@ -943,6 +954,7 @@ _cf_classes = {}
 def curseforge_post(path: str, payload: dict, api_key: str):
     if not api_key:
         raise LauncherError("Brak klucza API CurseForge. Wpisz go w Ustawieniach.")
+    _cdn_key["value"] = api_key
     try:
         return get_json(CURSEFORGE + path, data=payload, headers={"x-api-key": api_key})
     except urllib.error.HTTPError as e:
