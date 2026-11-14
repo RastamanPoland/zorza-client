@@ -1,19 +1,71 @@
 <script>
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
 
   let info = $state(null);
   let latest = $state("sprawdzam…");
-  let error = $state("");
+  let status = $state({ text: "Uruchamianie…", error: false });
 
-  onMount(async () => {
+  // logowanie
+  let account = $state(null);
+  let loggingIn = $state(false);
+  let loginCode = $state(null); // { code, uri } gdy trzeba wpisać kod
+  let accountMenu = $state(false);
+
+  function setStatus(text, error = false) {
+    status = { text, error };
+  }
+
+  async function login() {
+    if (loggingIn) return;
+    accountMenu = false;
+    loggingIn = true;
+    setStatus("Logowanie…");
     try {
-      info = await invoke("app_info");
-      latest = await invoke("latest_minecraft");
+      account = await invoke("login");
+      setStatus(`Zalogowano jako ${account.name}`);
     } catch (e) {
-      error = String(e);
-      latest = "nie udało się sprawdzić";
+      setStatus(String(e), true);
+    } finally {
+      loggingIn = false;
+      loginCode = null;
     }
+  }
+
+  async function cancelLogin() {
+    loginCode = null;
+    await invoke("cancel_login");
+  }
+
+  async function logout() {
+    accountMenu = false;
+    await invoke("logout");
+    account = null;
+    setStatus("Wylogowano");
+  }
+
+  function copyCode() {
+    navigator.clipboard?.writeText(loginCode.code).catch(() => {});
+  }
+
+  onMount(() => {
+    const unlisten = listen("login-code", (event) => {
+      loginCode = event.payload;
+      copyCode();
+    });
+    (async () => {
+      try {
+        info = await invoke("app_info");
+        setStatus(`Zorza Client ${info.version} · dane: ${info.data_dir}`);
+        if (await invoke("has_saved_login")) login(); // ciche odświeżenie zapisanej sesji
+        latest = await invoke("latest_minecraft");
+      } catch (e) {
+        setStatus(String(e), true);
+        latest = "nie udało się sprawdzić";
+      }
+    })();
+    return () => unlisten.then((fn) => fn());
   });
 </script>
 
@@ -30,7 +82,17 @@
     <button disabled>Modpacki…</button>
     <button disabled>Ustawienia</button>
     <div class="spacer"></div>
-    <button disabled>Zaloguj się ▾</button>
+    <div class="menu-wrap">
+      <button onclick={() => (account ? (accountMenu = !accountMenu) : login())} disabled={loggingIn && !loginCode}>
+        {#if loggingIn}Logowanie…{:else if account}● {account.name} ▾{:else}Zaloguj się{/if}
+      </button>
+      {#if accountMenu && account}
+        <div class="menu">
+          <div class="menu-item muted">Zalogowano: {account.name}</div>
+          <button class="menu-item" onclick={logout}>Wyloguj</button>
+        </div>
+      {/if}
+    </div>
   </nav>
 
   <main class="body">
@@ -49,16 +111,24 @@
     </aside>
   </main>
 
-  <footer class="status">
-    {#if error}
-      <span class="err">Błąd: {error}</span>
-    {:else if info}
-      Zorza Client {info.version} (Tauri) · {info.os} · dane: {info.data_dir}
-    {:else}
-      Uruchamianie…
-    {/if}
-  </footer>
+  <footer class="status" class:err={status.error}>{status.text}</footer>
 </div>
+
+{#if loginCode}
+  <div class="overlay">
+    <div class="dialog">
+      <h2>Zaloguj się kontem Microsoft</h2>
+      <p class="muted">Wejdź na {loginCode.uri} i wpisz kod:</p>
+      <div class="code">{loginCode.code}</div>
+      <p class="muted small">Kod jest już w schowku. Okno zamknie się samo po zalogowaniu.</p>
+      <div class="row">
+        <button class="primary" onclick={() => invoke("open_url", { url: loginCode.uri })}>Otwórz stronę</button>
+        <button onclick={copyCode}>Kopiuj kod</button>
+        <button onclick={cancelLogin}>Anuluj</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .window { display: flex; flex-direction: column; height: 100%; }
@@ -100,5 +170,24 @@
   .wide { width: 100%; margin-top: 12px; padding: 10px; }
   .status { background: var(--panel); color: var(--muted); font-size: 12px; padding: 6px 12px; flex: none;
             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: text; }
-  .err { color: var(--red); }
+  .status.err { color: var(--red); }
+  .menu-wrap { position: relative; }
+  .menu {
+    position: absolute; right: 0; top: calc(100% + 4px); min-width: 200px; z-index: 10;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 4px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  }
+  .menu-item { display: block; width: 100%; text-align: left; padding: 8px 10px; background: none; border-radius: 6px; }
+  .overlay { position: fixed; inset: 0; background: rgba(4, 6, 16, 0.7); display: grid; place-items: center; z-index: 20; }
+  .dialog {
+    width: 440px; background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
+    padding: 24px; text-align: center; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+  }
+  .dialog h2 { margin: 0 0 6px; font-size: 19px; }
+  .code {
+    font-family: Consolas, "Cascadia Mono", monospace; font-size: 38px; font-weight: 700;
+    color: var(--green); letter-spacing: 3px; margin: 14px 0; user-select: text;
+  }
+  .small { font-size: 12px; }
+  .row { display: flex; gap: 8px; justify-content: center; margin-top: 18px; }
 </style>

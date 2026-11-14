@@ -1,10 +1,17 @@
+mod auth;
+
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tauri::{AppHandle, State};
+
+use auth::{AuthState, PublicAccount};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 
-fn user_agent() -> String {
+pub(crate) fn user_agent() -> String {
     format!("RastamanPoland/zorza-client/{VERSION} (github.com/RastamanPoland/zorza-client)")
 }
 
@@ -59,10 +66,67 @@ async fn latest_minecraft() -> Result<String, String> {
         .ok_or_else(|| "Nieoczekiwana odpowiedź Mojangu".to_string())
 }
 
+/// Logowanie. Gdy potrzebny jest kod, okno dostaje zdarzenie "login-code".
+#[tauri::command]
+async fn login(app: AppHandle, state: State<'_, AuthState>) -> Result<PublicAccount, String> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    if let Some(old) = state.cancel.lock().unwrap().replace(cancel.clone()) {
+        old.store(true, Ordering::Relaxed); // tylko jedno logowanie naraz
+    }
+    let result = auth::login(&app, &cancel).await;
+    {
+        let mut current = state.cancel.lock().unwrap();
+        if current.as_ref().is_some_and(|c| Arc::ptr_eq(c, &cancel)) {
+            *current = None;
+        }
+    }
+    let account = result?;
+    let public = PublicAccount::from(&account);
+    *state.account.lock().unwrap() = Some(account);
+    Ok(public)
+}
+
+#[tauri::command]
+fn cancel_login(state: State<'_, AuthState>) {
+    if let Some(c) = state.cancel.lock().unwrap().take() {
+        c.store(true, Ordering::Relaxed);
+    }
+}
+
+#[tauri::command]
+fn logout(state: State<'_, AuthState>) {
+    auth::forget_saved_login();
+    *state.account.lock().unwrap() = None;
+}
+
+#[tauri::command]
+fn has_saved_login() -> bool {
+    auth::has_saved_login()
+}
+
+/// Otwiera strone w domyslnej przegladarce (tylko https).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("Można otwierać tylko adresy https".into());
+    }
+    tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![app_info, latest_minecraft])
+        .plugin(tauri_plugin_opener::init())
+        .manage(AuthState::default())
+        .invoke_handler(tauri::generate_handler![
+            app_info,
+            latest_minecraft,
+            login,
+            cancel_login,
+            logout,
+            has_saved_login,
+            open_url
+        ])
         .run(tauri::generate_context!())
         .expect("nie udało się uruchomić Zorza Client");
 }
