@@ -1,4 +1,5 @@
 mod auth;
+mod content;
 mod game;
 mod net;
 mod profiles;
@@ -182,6 +183,153 @@ fn open_folder(pid: String, sub: Option<String>) -> Result<(), String> {
     tauri_plugin_opener::open_path(path, None::<&str>).map_err(|e| e.to_string())
 }
 
+// ----------------------------------------------------------------- mody i paczki
+
+fn checked_dir(pid: &str) -> Result<PathBuf, String> {
+    if pid == "default" || profiles::safe_pid(pid) {
+        Ok(profiles::profile_dir(pid))
+    } else {
+        Err("Nieprawidłowy profil".into())
+    }
+}
+
+fn profile_of(pid: &str) -> Result<Value, String> {
+    profiles::load_profiles()["profiles"].get(pid).cloned().ok_or_else(|| "Nie ma takiego profilu".to_string())
+}
+
+/// "latest" -> numer najnowszego wydania.
+async fn concrete_version(v: &str) -> Result<String, String> {
+    if v != "latest" {
+        return Ok(v.to_string());
+    }
+    let manifest = net::get_json(&net::client()?, "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json").await?;
+    manifest["latest"]["release"].as_str().map(str::to_string).ok_or("Brak najnowszej wersji".into())
+}
+
+fn world_dir(pid: &str, world: &str) -> Result<PathBuf, String> {
+    if world.is_empty() || world.contains('/') || world.contains('\\') || world == "." || world == ".." {
+        return Err("Nieprawidłowa nazwa świata".into());
+    }
+    let dir = checked_dir(pid)?.join("saves").join(world);
+    if !dir.join("level.dat").exists() {
+        return Err("Nie ma takiego świata".into());
+    }
+    Ok(dir)
+}
+
+#[tauri::command]
+async fn search_content(
+    kind: String,
+    source: String,
+    query: String,
+    pid: String,
+    sort: String,
+    offset: usize,
+) -> Result<(String, Vec<content::Hit>), String> {
+    let p = profile_of(&pid)?;
+    let version = concrete_version(p["game_version"].as_str().unwrap_or("latest")).await?;
+    let loader = p["loader"].as_str().unwrap_or("fabric").to_string();
+    let hits = content::search(&kind, &source, query.trim(), &version, &loader, &sort, offset).await?;
+    Ok((version, hits))
+}
+
+#[tauri::command]
+async fn project_details(hit: content::Hit) -> Result<content::Details, String> {
+    content::details(&hit).await
+}
+
+#[tauri::command]
+async fn install_content(
+    pid: String,
+    kind: String,
+    hit: content::Hit,
+    world: Option<String>,
+    game_state: State<'_, GameState>,
+) -> Result<Vec<String>, String> {
+    if game_state.busy.lock().unwrap().as_deref() == Some(pid.as_str()) {
+        return Err("Zamknij grę przed instalowaniem.".into());
+    }
+    let dir = checked_dir(&pid)?;
+    let p = profile_of(&pid)?;
+    let version = concrete_version(p["game_version"].as_str().unwrap_or("latest")).await?;
+    match kind.as_str() {
+        "mod" => content::install_mod(&hit, &version, &dir, p["loader"].as_str().unwrap_or("fabric")).await,
+        "resourcepack" => {
+            content::install_pack(&hit, &kind, &version, &dir.join("resourcepacks"), &content::resourcepack_index(&dir)).await
+        }
+        "datapack" => {
+            let world = world_dir(&pid, world.as_deref().unwrap_or_default())?;
+            content::install_pack(&hit, &kind, &version, &world.join("datapacks"), &content::datapack_index(&world)).await
+        }
+        _ => Err("Nieznany typ".into()),
+    }
+}
+
+/// Instaluje modpack do nowego folderu profilu `pid`. Profil dopisuje okno po sukcesie.
+#[tauri::command]
+async fn install_modpack(app: AppHandle, pid: String, hit: content::Hit) -> Result<content::ModpackInfo, String> {
+    if !profiles::safe_pid(&pid) || pid == "default" {
+        return Err("Nieprawidłowy identyfikator profilu".into());
+    }
+    let dir = profiles::profile_dir(&pid);
+    if dir.exists() {
+        return Err(format!("Folder {} już istnieje", dir.display()));
+    }
+    let reporter = AppReporter { app };
+    let result = content::install_modpack(&hit, &dir, &reporter).await;
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&dir); // folder utworzony wylacznie przez te instalacje
+    }
+    result
+}
+
+#[tauri::command]
+fn installed_mods(pid: String) -> Result<Vec<content::InstalledFile>, String> {
+    Ok(content::list_mods(&checked_dir(&pid)?))
+}
+
+#[tauri::command]
+fn toggle_mod(pid: String, file: String) -> Result<bool, String> {
+    content::toggle_mod(&checked_dir(&pid)?, &file)
+}
+
+#[tauri::command]
+fn remove_mod(pid: String, file: String) -> Result<(), String> {
+    content::remove_mod(&checked_dir(&pid)?, &file)
+}
+
+#[tauri::command]
+fn installed_packs(pid: String) -> Result<Vec<content::InstalledFile>, String> {
+    let dir = checked_dir(&pid)?;
+    Ok(content::list_packs(&dir.join("resourcepacks"), &content::resourcepack_index(&dir)))
+}
+
+#[tauri::command]
+fn remove_resourcepack(pid: String, file: String) -> Result<(), String> {
+    let dir = checked_dir(&pid)?;
+    content::remove_pack(&dir.join("resourcepacks"), &content::resourcepack_index(&dir), &file)
+}
+
+#[tauri::command]
+fn list_worlds(pid: String) -> Result<Vec<String>, String> {
+    Ok(content::list_worlds(&checked_dir(&pid)?))
+}
+
+#[tauri::command]
+fn installed_keys(pid: String, kind: String) -> Result<Vec<String>, String> {
+    Ok(content::installed_keys(&checked_dir(&pid)?, &kind))
+}
+
+#[tauri::command]
+async fn loader_versions(loader: String, game_version: String) -> Result<Vec<game::LoaderVersion>, String> {
+    game::loader_versions(&net::client()?, &loader, &game_version).await
+}
+
+#[tauri::command]
+fn has_curseforge_key() -> bool {
+    !content::cf_key().is_empty()
+}
+
 // -------------------------------------------------------------------------- gra
 
 #[derive(Default)]
@@ -332,7 +480,20 @@ pub fn run() {
             copy_profile,
             open_folder,
             launch,
-            stop_game
+            stop_game,
+            search_content,
+            project_details,
+            install_content,
+            install_modpack,
+            installed_mods,
+            toggle_mod,
+            remove_mod,
+            installed_packs,
+            remove_resourcepack,
+            list_worlds,
+            installed_keys,
+            loader_versions,
+            has_curseforge_key
         ])
         .run(tauri::generate_context!())
         .expect("nie udało się uruchomić Zorza Client");

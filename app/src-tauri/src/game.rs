@@ -14,6 +14,11 @@ const JAVA_RUNTIMES_URL: &str =
     "https://piston-meta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 const FABRIC_META: &str = "https://meta.fabricmc.net/v2";
 const QUILT_META: &str = "https://meta.quiltmc.org/v3";
+const FORGE_PROMOS: &str = "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json";
+const FORGE_METADATA: &str = "https://files.minecraftforge.net/net/minecraftforge/forge/maven-metadata.json";
+const FORGE_MAVEN: &str = "https://maven.minecraftforge.net/net/minecraftforge/forge";
+const NEOFORGE_MAVEN: &str = "https://maven.neoforged.net/releases/net/neoforged/neoforge";
+const NEOFORGE_VERSIONS: &str = "https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge";
 
 pub const CP_SEP: &str = if cfg!(windows) { ";" } else { ":" };
 
@@ -227,11 +232,176 @@ async fn resolve_version(client: &reqwest::Client, cfg: &LaunchCfg, rep: &dyn Re
             v["_loader"] = json!([cfg.loader, lv]);
         }
         "forge" | "neoforge" => {
-            return Err("Forge i NeoForge będą w nowej wersji w kolejnym kroku. Na razie użyj wersji w Pythonie.".into())
+            let (version, child) = install_forge_like(client, &cfg.loader, &vid, &cfg.loader_version, &v, cfg, rep).await?;
+            let child_id = child["id"].as_str().filter(|s| !s.is_empty()).unwrap_or(&vid).to_string();
+            merge_inherited(&mut v, &child);
+            v["_id"] = json!(child_id);
+            v["_loader"] = json!([cfg.loader, version]);
         }
         _ => {}
     }
     Ok(v)
+}
+
+/// 1.21.1 -> "21.1.", 1.21 -> "21.0.", 26.1 -> "26.1.0.", 26.1.2 -> "26.1.2."
+fn neoforge_prefix(mc: &str) -> String {
+    let p: Vec<&str> = mc.split('.').collect();
+    if p.first() == Some(&"1") {
+        format!("{}.{}.", p.get(1).unwrap_or(&"0"), p.get(2).unwrap_or(&"0"))
+    } else {
+        format!("{}.{}.{}.", p.first().unwrap_or(&"0"), p.get(1).unwrap_or(&"0"), p.get(2).unwrap_or(&"0"))
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct LoaderVersion {
+    pub version: String,
+    pub stable: bool,
+}
+
+/// Dostepne wersje loadera dla danej wersji gry, od najnowszej.
+pub async fn loader_versions(client: &reqwest::Client, loader: &str, game_version: &str) -> Result<Vec<LoaderVersion>, String> {
+    let mc = if game_version == "latest" {
+        get_json(client, MANIFEST_URL).await?["latest"]["release"].as_str().unwrap_or_default().to_string()
+    } else {
+        game_version.to_string()
+    };
+    let unstable = |s: &str| s.contains("beta") || s.contains("alpha") || s.contains("pre") || s.contains("rc");
+    Ok(match loader {
+        "fabric" | "quilt" => {
+            let meta = if loader == "fabric" { FABRIC_META } else { QUILT_META };
+            arr(&get_json(client, &format!("{meta}/versions/loader/{}", enc(&mc))).await?)
+                .iter()
+                .map(|l| {
+                    let version = l["loader"]["version"].as_str().unwrap_or_default().to_string();
+                    let stable = if loader == "fabric" { l["loader"]["stable"].as_bool().unwrap_or(false) } else { !unstable(&version) };
+                    LoaderVersion { version, stable }
+                })
+                .collect()
+        }
+        "forge" => {
+            let prefix = format!("{mc}-");
+            let mut list: Vec<LoaderVersion> = arr(&get_json(client, FORGE_METADATA).await?[mc.as_str()])
+                .iter()
+                .filter_map(|v| v.as_str()?.strip_prefix(&prefix).map(str::to_string))
+                .map(|version| LoaderVersion { stable: true, version })
+                .collect();
+            list.reverse();
+            list
+        }
+        "neoforge" => {
+            let prefix = neoforge_prefix(&mc);
+            let mut list: Vec<LoaderVersion> = arr(&get_json(client, NEOFORGE_VERSIONS).await?["versions"])
+                .iter()
+                .filter_map(|v| v.as_str().filter(|s| s.starts_with(&prefix)).map(str::to_string))
+                .map(|version| LoaderVersion { stable: !unstable(&version), version })
+                .collect();
+            list.reverse();
+            list
+        }
+        _ => vec![],
+    })
+}
+
+async fn forge_like_version(client: &reqwest::Client, loader: &str, mc: &str, pin: &str) -> Result<String, String> {
+    if !pin.is_empty() {
+        return Ok(pin.to_string());
+    }
+    if loader == "forge" {
+        let promos = get_json(client, FORGE_PROMOS).await?;
+        let promos = &promos["promos"];
+        return promos[format!("{mc}-recommended").as_str()]
+            .as_str()
+            .or_else(|| promos[format!("{mc}-latest").as_str()].as_str())
+            .map(str::to_string)
+            .ok_or_else(|| format!("Forge nie ma jeszcze wersji dla Minecraft {mc}"));
+    }
+    let list = loader_versions(client, "neoforge", mc).await?;
+    list.iter()
+        .find(|l| l.stable)
+        .or(list.first())
+        .map(|l| l.version.clone())
+        .ok_or_else(|| format!("NeoForge nie ma jeszcze wersji dla Minecraft {mc}"))
+}
+
+/// Uruchamia oficjalny instalator Forge/NeoForge bez okna. Zwraca (wersja, json wersji).
+async fn install_forge_like(
+    client: &reqwest::Client,
+    loader: &str,
+    mc: &str,
+    pin: &str,
+    vanilla: &Value,
+    cfg: &LaunchCfg,
+    rep: &dyn Reporter,
+) -> Result<(String, Value), String> {
+    let label = if loader == "forge" { "Forge" } else { "NeoForge" };
+    let version = forge_like_version(client, loader, mc, pin).await?;
+    if !version.chars().all(|c| c.is_ascii_alphanumeric() || ".-+_".contains(c)) {
+        return Err(format!("Nieprawidłowa wersja {label}: {version}"));
+    }
+    let url = if loader == "forge" {
+        format!("{FORGE_MAVEN}/{mc}-{version}/forge-{mc}-{version}-installer.jar")
+    } else {
+        format!("{NEOFORGE_MAVEN}/{version}/neoforge-{version}-installer.jar")
+    };
+    let installer = root_dir().join("cache").join("installers").join(url.rsplit('/').next().unwrap_or("installer.jar"));
+    rep.status(&format!("Pobieram instalator {label} {version}…"));
+    download(client, &Task { url, dest: installer.clone(), sha1: None, size: None })
+        .await
+        .map_err(|e| format!("{e}. Sprawdź, czy {label} {version} istnieje dla Minecraft {mc}."))?;
+    let vid = (|| {
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&installer).ok()?).ok()?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("install_profile.json").ok()?, &mut text).ok()?;
+        let profile: Value = serde_json::from_str(&text).ok()?;
+        profile["version"].as_str().map(str::to_string)
+    })();
+    let Some(vid) = vid else {
+        let _ = std::fs::remove_file(&installer);
+        return Err(format!("Instalator {label} {version} jest uszkodzony, spróbuj ponownie"));
+    };
+    if vid.is_empty() || vid.contains('/') || vid.contains('\\') || vid.starts_with('.') {
+        return Err(format!("Nieoczekiwana nazwa wersji w instalatorze {label}: {vid}"));
+    }
+    let vjson = versions().join(&vid).join(format!("{vid}.json"));
+    if !vjson.exists() {
+        let profiles_file = root_dir().join("launcher_profiles.json"); // instalator nie dziala bez tego pliku
+        if !profiles_file.exists() {
+            std::fs::write(&profiles_file, r#"{"profiles":{}}"#).map_err(|e| e.to_string())?;
+        }
+        let java = ensure_java(client, vanilla, cfg, rep).await?;
+        rep.status(&format!("Instaluję {label} {version}. Za pierwszym razem może to potrwać kilka minut…"));
+        let root = root_dir();
+        let dir = installer.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
+        let installer_path = installer.clone();
+        let output = tauri::async_runtime::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new(&java);
+            cmd.arg("-jar").arg(&installer_path).arg("--installClient").arg(&root).current_dir(dir);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x0800_0000);
+            }
+            cmd.output()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("Nie udało się uruchomić instalatora {label}: {e}"))?;
+        if !output.status.success() || !vjson.exists() {
+            let out = String::from_utf8_lossy(&output.stdout);
+            let err = String::from_utf8_lossy(&output.stderr);
+            let tail = |t: &str, n: usize| t.chars().rev().take(n).collect::<String>().chars().rev().collect::<String>();
+            return Err(format!(
+                "Instalator {label} zakończył się błędem (kod {:?}):\n{}{}",
+                output.status.code(),
+                tail(&out, 1200),
+                tail(&err, 600)
+            ));
+        }
+    }
+    let text = std::fs::read_to_string(&vjson).map_err(|e| e.to_string())?;
+    let child: Value = serde_json::from_str(&text).map_err(|e| format!("Uszkodzony plik wersji {label}: {e}"))?;
+    Ok((version, child))
 }
 
 /// Zwraca (zadania pobierania, classpath, jary z natywnymi bibliotekami).
@@ -444,8 +614,7 @@ fn build_command(
     natives: &Path,
 ) -> Vec<String> {
     let vid = v["_id"].as_str().unwrap_or_default();
-    let mc = v["_mc"].as_str().unwrap_or(vid);
-    let client_jar = versions().join(mc).join(format!("{mc}.jar"));
+    let client_jar = versions().join(vid).join(format!("{vid}.jar"));
     let mut cp: Vec<String> = classpath.iter().map(|p| p.display().to_string()).collect();
     cp.push(client_jar.display().to_string());
     let values: HashMap<&str, String> = HashMap::from([
@@ -550,6 +719,12 @@ pub async fn prepare(cfg: &LaunchCfg, account: &Account, game_dir: &Path, rep: &
     if let Some(missing) = classpath.iter().find(|p| !p.exists()) {
         return Err(format!("Brakuje biblioteki {}", missing.display()));
     }
+    let vid = v["_id"].as_str().unwrap_or_default().to_string();
+    let jar = versions().join(&vid).join(format!("{vid}.jar"));
+    if vid != mc && !jar.exists() {
+        // jak oficjalny launcher: gra pod nazwa wersji z loaderem
+        std::fs::copy(versions().join(&mc).join(format!("{mc}.jar")), &jar).map_err(|e| e.to_string())?;
+    }
     rep.status("Pobieram zasoby…");
     let asset_tasks = collect_assets(&client, &v).await?;
     download_all(&client, asset_tasks, 16, |d, t| rep.progress(d, t)).await?;
@@ -578,6 +753,14 @@ mod tests {
         assert_eq!(substitute("-D${a}=${b}/${a}", &values), "-DX=${b}/X");
         assert_eq!(substitute("bez", &values), "bez");
         assert_eq!(substitute("${a", &values), "${a");
+    }
+
+    #[test]
+    fn neoforge_prefixes() {
+        assert_eq!(neoforge_prefix("1.21.1"), "21.1.");
+        assert_eq!(neoforge_prefix("1.21"), "21.0.");
+        assert_eq!(neoforge_prefix("26.1"), "26.1.0.");
+        assert_eq!(neoforge_prefix("26.1.2"), "26.1.2.");
     }
 
     #[test]

@@ -37,6 +37,16 @@ pub async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value, Stri
         .map_err(|e| format!("Nieprawidłowa odpowiedź z {url}: {e}"))
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cdn_hosts() {
+        assert!(super::is_curseforge_cdn("https://edge.forgecdn.net/files/1/2/a.jar"));
+        assert!(!super::is_curseforge_cdn("https://evilforgecdn.net/a"));
+        assert!(!super::is_curseforge_cdn("https://cdn.modrinth.com/a"));
+    }
+}
+
 pub fn sha1_hex(data: &[u8]) -> String {
     let mut hasher = Sha1::new();
     hasher.update(data);
@@ -56,9 +66,20 @@ fn part_path(p: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+fn is_curseforge_cdn(url: &str) -> bool {
+    let host = url.strip_prefix("https://").unwrap_or_default().split(['/', ':']).next().unwrap_or_default();
+    host == "forgecdn.net" || host.ends_with(".forgecdn.net")
+}
+
 async fn fetch(client: &reqwest::Client, t: &Task) -> Result<Vec<u8>, String> {
-    let bytes = client
-        .get(&t.url)
+    let mut req = client.get(&t.url);
+    if is_curseforge_cdn(&t.url) {
+        let key = crate::content::cf_key(); // CurseForge wymaga klucza takze przy pobieraniu plikow
+        if !key.is_empty() {
+            req = req.header("x-api-key", key);
+        }
+    }
+    let bytes = req
         .send()
         .await
         .map_err(|e| e.to_string())?
