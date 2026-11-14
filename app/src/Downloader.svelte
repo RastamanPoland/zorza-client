@@ -206,7 +206,7 @@
             {#if details?.followers} · {formatCount(details.followers)} obserwujących{/if}
             {#if details?.updated} · aktualizacja: {details.updated}{/if}
             {#if details?.license} · licencja: {details.license}{/if}
-            {#if details?.categories?.length}<br />Kategorie: {details.categories.slice(0, 8).join(", "){/if}
+            {#if details?.categories?.length}<br />Kategorie: {details.categories.slice(0, 8).join(", ")}{/if}
           </div>
           <div class="links">
             {#each details?.links ?? (current.url ? [["Strona projektu", current.url]] : []) as [label, url]}
