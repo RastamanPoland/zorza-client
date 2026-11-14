@@ -52,6 +52,11 @@ jobs:
       - name: Kompilacja
         run: npx tauri build --bundles ${{ matrix.bundles }}
 
+      - name: Testy Rust (Linux)
+        if: runner.os == 'Linux'
+        working-directory: app/src-tauri
+        run: cargo test --lib
+
       - name: Wyniki
         uses: actions/upload-artifact@v4
         with:
