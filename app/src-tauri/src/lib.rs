@@ -1,3 +1,5 @@
+#[macro_use]
+mod i18n;
 mod auth;
 mod content;
 mod game;
@@ -62,7 +64,7 @@ async fn latest_minecraft() -> Result<String, String> {
         .get(MANIFEST_URL)
         .send()
         .await
-        .map_err(|e| format!("Brak połączenia z serwerami Mojangu: {e}"))?
+        .map_err(|e| tr!("Cannot reach Mojang servers: {e}", "Brak połączenia z serwerami Mojangu: {e}"))?
         .error_for_status()
         .map_err(|e| e.to_string())?
         .json()
@@ -71,7 +73,7 @@ async fn latest_minecraft() -> Result<String, String> {
     manifest["latest"]["release"]
         .as_str()
         .map(str::to_string)
-        .ok_or_else(|| "Nieoczekiwana odpowiedź Mojangu".to_string())
+        .ok_or_else(|| tr!("Unexpected response from Mojang", "Nieoczekiwana odpowiedź Mojangu"))
 }
 
 /// Logowanie. Gdy potrzebny jest kod, okno dostaje zdarzenie "login-code".
@@ -116,7 +118,7 @@ fn has_saved_login() -> bool {
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     if !url.starts_with("https://") {
-        return Err("Można otwierać tylko adresy https".into());
+        return Err(tr!("Only https addresses can be opened", "Można otwierać tylko adresy https"));
     }
     tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
@@ -144,7 +146,9 @@ fn get_config() -> Value {
 
 #[tauri::command]
 fn save_config(update: Map<String, Value>) -> Result<(), String> {
-    profiles::save_config(&update).map(|_| ())
+    let cfg = profiles::save_config(&update)?;
+    i18n::set_language(cfg["language"].as_str().unwrap_or("en"));
+    Ok(())
 }
 
 #[tauri::command]
@@ -155,7 +159,7 @@ async fn list_versions() -> Result<Vec<String>, String> {
 #[tauri::command]
 async fn copy_profile(src: String, dst: String) -> Result<(), String> {
     if !(src == "default" || profiles::safe_pid(&src)) || !profiles::safe_pid(&dst) || dst == "default" {
-        return Err("Nieprawidłowy identyfikator profilu".into());
+        return Err(tr!("Invalid profile ID", "Nieprawidłowy identyfikator profilu"));
     }
     let (from, to) = (profiles::profile_dir(&src), profiles::profile_dir(&dst));
     tauri::async_runtime::spawn_blocking(move || profiles::copy_dir(&from, &to))
@@ -171,11 +175,11 @@ fn open_folder(pid: String, sub: Option<String>) -> Result<(), String> {
     } else if pid == "default" || profiles::safe_pid(&pid) {
         profiles::profile_dir(&pid)
     } else {
-        return Err("Nieprawidłowy profil".into());
+        return Err(tr!("Invalid profile", "Nieprawidłowy profil"));
     };
     if let Some(sub) = sub {
         if !matches!(sub.as_str(), "mods" | "resourcepacks" | "saves" | "shaderpacks" | "config") {
-            return Err("Nieznany folder".into());
+            return Err(tr!("Unknown folder", "Nieznany folder"));
         }
         path = path.join(sub);
     }
@@ -189,12 +193,12 @@ fn checked_dir(pid: &str) -> Result<PathBuf, String> {
     if pid == "default" || profiles::safe_pid(pid) {
         Ok(profiles::profile_dir(pid))
     } else {
-        Err("Nieprawidłowy profil".into())
+        Err(tr!("Invalid profile", "Nieprawidłowy profil"))
     }
 }
 
 fn profile_of(pid: &str) -> Result<Value, String> {
-    profiles::load_profiles()["profiles"].get(pid).cloned().ok_or_else(|| "Nie ma takiego profilu".to_string())
+    profiles::load_profiles()["profiles"].get(pid).cloned().ok_or_else(|| tr!("No such profile", "Nie ma takiego profilu"))
 }
 
 /// "latest" -> numer najnowszego wydania.
@@ -203,16 +207,16 @@ async fn concrete_version(v: &str) -> Result<String, String> {
         return Ok(v.to_string());
     }
     let manifest = net::get_json(&net::client()?, "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json").await?;
-    manifest["latest"]["release"].as_str().map(str::to_string).ok_or("Brak najnowszej wersji".into())
+    manifest["latest"]["release"].as_str().map(str::to_string).ok_or_else(|| tr!("No latest version", "Brak najnowszej wersji"))
 }
 
 fn world_dir(pid: &str, world: &str) -> Result<PathBuf, String> {
     if world.is_empty() || world.contains('/') || world.contains('\\') || world == "." || world == ".." {
-        return Err("Nieprawidłowa nazwa świata".into());
+        return Err(tr!("Invalid world name", "Nieprawidłowa nazwa świata"));
     }
     let dir = checked_dir(pid)?.join("saves").join(world);
     if !dir.join("level.dat").exists() {
-        return Err("Nie ma takiego świata".into());
+        return Err(tr!("No such world", "Nie ma takiego świata"));
     }
     Ok(dir)
 }
@@ -247,7 +251,7 @@ async fn install_content(
     game_state: State<'_, GameState>,
 ) -> Result<Vec<String>, String> {
     if game_state.busy.lock().unwrap().as_deref() == Some(pid.as_str()) {
-        return Err("Zamknij grę przed instalowaniem.".into());
+        return Err(tr!("Close the game before installing.", "Zamknij grę przed instalowaniem."));
     }
     let dir = checked_dir(&pid)?;
     let p = profile_of(&pid)?;
@@ -261,7 +265,7 @@ async fn install_content(
             let world = world_dir(&pid, world.as_deref().unwrap_or_default())?;
             content::install_pack(&hit, &kind, &version, &world.join("datapacks"), &content::datapack_index(&world)).await
         }
-        _ => Err("Nieznany typ".into()),
+        _ => Err(tr!("Unknown type", "Nieznany typ")),
     }
 }
 
@@ -269,11 +273,11 @@ async fn install_content(
 #[tauri::command]
 async fn install_modpack(app: AppHandle, pid: String, hit: content::Hit) -> Result<content::ModpackInfo, String> {
     if !profiles::safe_pid(&pid) || pid == "default" {
-        return Err("Nieprawidłowy identyfikator profilu".into());
+        return Err(tr!("Invalid profile ID", "Nieprawidłowy identyfikator profilu"));
     }
     let dir = profiles::profile_dir(&pid);
     if dir.exists() {
-        return Err(format!("Folder {} już istnieje", dir.display()));
+        return Err(tr!("Folder {} already exists", "Folder {} już istnieje", dir.display()));
     }
     let reporter = AppReporter { app };
     let result = content::install_modpack(&hit, &dir, &reporter).await;
@@ -380,11 +384,11 @@ async fn launch(
     auth: State<'_, AuthState>,
     game_state: State<'_, GameState>,
 ) -> Result<(), String> {
-    let account = auth.account.lock().unwrap().clone().ok_or("Najpierw się zaloguj")?;
+    let account = auth.account.lock().unwrap().clone().ok_or_else(|| tr!("Sign in first", "Najpierw się zaloguj"))?;
     {
         let mut busy = game_state.busy.lock().unwrap();
         if busy.is_some() {
-            return Err("Gra już działa albo właśnie się uruchamia".into());
+            return Err(tr!("The game is already running or starting", "Gra już działa albo właśnie się uruchamia"));
         }
         *busy = Some(pid.clone());
     }
@@ -405,12 +409,12 @@ async fn start_game(
     busy: Arc<Mutex<Option<String>>>,
 ) -> Result<(), String> {
     let data = profiles::load_profiles();
-    let profile = data["profiles"].get(pid).cloned().ok_or("Nie ma takiego profilu")?;
+    let profile = data["profiles"].get(pid).cloned().ok_or_else(|| tr!("No such profile", "Nie ma takiego profilu"))?;
     let cfg = launch_cfg(&profile, &profiles::load_config());
     let game_dir = profiles::profile_dir(pid);
     let reporter = AppReporter { app: app.clone() };
     let cmd = game::prepare(&cfg, account, &game_dir, &reporter).await?;
-    let _ = app.emit("status", format!("Uruchamiam grę jako {}…", account.name));
+    let _ = app.emit("status", tr!("Starting the game as {}…", "Uruchamiam grę jako {}…", account.name));
     let mut command = Command::new(&cmd[0]);
     command.args(&cmd[1..]).current_dir(&game_dir).stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
     #[cfg(windows)]
@@ -418,7 +422,7 @@ async fn start_game(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // bez okna konsoli
     }
-    let mut child = command.spawn().map_err(|e| format!("Nie udało się uruchomić Javy ({}): {e}", cmd[0]))?;
+    let mut child = command.spawn().map_err(|e| tr!("Could not start Java ({}): {e}", "Nie udało się uruchomić Javy ({}): {e}", cmd[0]))?;
     if let Some(out) = child.stdout.take() {
         spawn_reader(app.clone(), out);
     }
@@ -453,13 +457,14 @@ async fn start_game(
 #[tauri::command]
 fn stop_game(game_state: State<'_, GameState>) -> Result<(), String> {
     match game_state.child.lock().unwrap().as_mut() {
-        Some(child) => child.kill().map_err(|e| format!("Nie udało się zatrzymać gry: {e}")),
-        None => Err("Gra nie działa".into()),
+        Some(child) => child.kill().map_err(|e| tr!("Could not stop the game: {e}", "Nie udało się zatrzymać gry: {e}")),
+        None => Err(tr!("The game is not running", "Gra nie działa")),
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    i18n::set_language(profiles::load_config()["language"].as_str().unwrap_or("en"));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AuthState::default())
@@ -496,5 +501,5 @@ pub fn run() {
             has_curseforge_key
         ])
         .run(tauri::generate_context!())
-        .expect("nie udało się uruchomić Zorza Client");
+        .expect("failed to start Zorza Client");
 }

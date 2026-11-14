@@ -2,21 +2,22 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
   import { plainText, formatCount } from "./lib/text.js";
+  import { t } from "./lib/i18n.svelte.js";
 
   // pid: profil docelowy; profile: jego dane; onModpack(hit): instalacja modpacka jako nowego profilu
   let { pid, profile, initialKind = "mod", onclose, onchanged, onModpack } = $props();
 
-  const KINDS = [
-    ["mod", "Mody"],
-    ["modpack", "Modpacki"],
-    ["resourcepack", "Paczki zasobów"],
-    ["datapack", "Paczki danych"],
+  const KINDS = () => [
+    ["mod", t("Mods", "Mody")],
+    ["modpack", t("Modpacks", "Modpacki")],
+    ["resourcepack", t("Resource packs", "Paczki zasobów")],
+    ["datapack", t("Data packs", "Paczki danych")],
   ];
-  const SORTS = [
-    ["downloads", "Popularność"],
-    ["relevance", "Trafność"],
-    ["updated", "Ostatnio zaktualizowane"],
-    ["newest", "Najnowsze"],
+  const SORTS = () => [
+    ["downloads", t("Popularity", "Popularność")],
+    ["relevance", t("Relevance", "Trafność")],
+    ["updated", t("Recently updated", "Ostatnio zaktualizowane")],
+    ["newest", t("Newest", "Najnowsze")],
   ];
   const LOADER_NAME = { fabric: "Fabric", quilt: "Quilt", forge: "Forge", neoforge: "NeoForge", vanilla: "Vanilla" };
 
@@ -53,18 +54,21 @@
   async function load(more = false) {
     if (source === "curseforge" && !cfKey) {
       results = [];
-      info = { text: "Brak klucza API CurseForge. Wpisz własny w Ustawieniach albo użyj Modrinth.", error: true };
+      info = { text: t("No CurseForge API key. Enter your own in Settings or use Modrinth.", "Brak klucza API CurseForge. Wpisz własny w Ustawieniach albo użyj Modrinth."), error: true };
       return;
     }
     if (kind === "mod" && profile.loader === "vanilla") {
       results = [];
-      info = { text: "Ten profil nie ma loadera modów. Wybierz Fabric, Quilt, Forge albo NeoForge w edycji profilu.", error: true };
+      info = { text: t("This profile has no mod loader. Choose Fabric, Quilt, Forge or NeoForge in the profile editor.", "Ten profil nie ma loadera modów. Wybierz Fabric, Quilt, Forge albo NeoForge w edycji profilu."), error: true };
       return;
     }
     if (more && (end || loading)) return;
     const my = ++req;
     loading = true;
-    info = { text: more ? "Wczytuję kolejne…" : query.trim() ? "Szukam…" : "Wczytuję najpopularniejsze…", error: false };
+    info = {
+      text: more ? t("Loading more…", "Wczytuję kolejne…") : query.trim() ? t("Searching…", "Szukam…") : t("Loading the most popular…", "Wczytuję najpopularniejsze…"),
+      error: false,
+    };
     try {
       const [v, hits] = await invoke("search_content", {
         kind, source, query, pid, sort: source === "modrinth" ? sort : "", offset: more ? results.length : 0,
@@ -80,8 +84,13 @@
       }
       end = hits.length < 30;
       const where = source === "modrinth" ? "Modrinth" : "CurseForge";
-      const forVersion = kind === "modpack" ? "" : ` dla Minecraft ${v}${kind === "mod" ? " · " + LOADER_NAME[profile.loader] : ""}`;
-      info = { text: results.length ? `${where}: ${results.length} wyników${forVersion}` : `${where}: brak wyników${forVersion}`, error: false };
+      const forVersion = kind === "modpack" ? "" : ` ${t("for Minecraft", "dla Minecraft")} ${v}${kind === "mod" ? " · " + LOADER_NAME[profile.loader] : ""}`;
+      info = {
+        text: results.length
+          ? `${where}: ${results.length} ${t("results", "wyników")}${forVersion}`
+          : `${where}: ${t("no results", "brak wyników")}${forVersion}`,
+        error: false,
+      };
     } catch (e) {
       if (my === req) info = { text: String(e), error: true };
     } finally {
@@ -110,16 +119,22 @@
     const r = current;
     if (!r || installing) return;
     if (kind === "modpack") {
-      message = { text: `Instaluję modpack „${r.title}”… Postęp widać na dole głównego okna.`, error: false };
+      message = {
+        text: t(`Installing modpack “${r.title}”… Progress is shown at the bottom of the main window.`, `Instaluję modpack „${r.title}”… Postęp widać na dole głównego okna.`),
+        error: false,
+      };
       onModpack(r);
       return;
     }
-    if (kind === "datapack" && !world) return (message = { text: "Wybierz świat.", error: true });
+    if (kind === "datapack" && !world) return (message = { text: t("Choose a world.", "Wybierz świat."), error: true });
     installing = true;
-    message = { text: `Instaluję: ${r.title}…`, error: false };
+    message = { text: `${t("Installing", "Instaluję")}: ${r.title}…`, error: false };
     try {
       const names = await invoke("install_content", { pid, kind, hit: r, world: kind === "datapack" ? world : null });
-      message = { text: "Zainstalowano: " + names.join(", ") + (kind === "datapack" ? ` (świat: ${world})` : ""), error: false };
+      message = {
+        text: `${t("Installed", "Zainstalowano")}: ${names.join(", ")}` + (kind === "datapack" ? ` (${t("world", "świat")}: ${world})` : ""),
+        error: false,
+      };
       await refreshInstalled();
       onchanged?.();
     } catch (e) {
@@ -154,7 +169,7 @@
 <div class="overlay">
   <div class="panel">
     <div class="tabs">
-      {#each KINDS as [k, label]}
+      {#each KINDS() as [k, label]}
         <button class:on={kind === k} onclick={() => setKind(k)}>{label}</button>
       {/each}
       <div class="spacer"></div>
@@ -162,11 +177,11 @@
       <button class:on={source === "curseforge"} onclick={() => setSource("curseforge")}>CurseForge</button>
     </div>
     <div class="search">
-      <input bind:value={query} placeholder="Szukaj…" onkeydown={(e) => e.key === "Enter" && load()} />
+      <input bind:value={query} placeholder={t("Search…", "Szukaj…")} onkeydown={(e) => e.key === "Enter" && load()} />
       <select bind:value={sort} onchange={() => load()} disabled={source !== "modrinth"}>
-        {#each SORTS as [id, label]}<option value={id}>{label}</option>{/each}
+        {#each SORTS() as [id, label]}<option value={id}>{label}</option>{/each}
       </select>
-      <button class="primary" onclick={() => load()}>Szukaj</button>
+      <button class="primary" onclick={() => load()}>{t("Search", "Szukaj")}</button>
     </div>
 
     <div class="content">
@@ -181,14 +196,14 @@
               <div class="rtitle">
                 {#if installed.has(r.source + ":" + r.id)}<span class="ok">✓</span>{/if}
                 {r.title}
-                <span class="muted">· {formatCount(r.downloads)} pobrań</span>
+                <span class="muted">· {formatCount(r.downloads)} {t("downloads", "pobrań")}</span>
               </div>
               <div class="muted clip">{r.description}</div>
             </div>
           </button>
         {/each}
         {#if !end && results.length}
-          <button class="more" onclick={() => load(true)} disabled={loading}>Pokaż więcej</button>
+          <button class="more" onclick={() => load(true)} disabled={loading}>{t("Show more", "Pokaż więcej")}</button>
         {/if}
       </div>
 
@@ -198,45 +213,45 @@
             {#if current.icon}<img src={current.icon} alt="" />{/if}
             <div>
               <div class="dtitle">{current.title}</div>
-              {#if current.author}<div class="muted">autor: {current.author}</div>{/if}
+              {#if current.author}<div class="muted">{t("by", "autor:")} {current.author}</div>{/if}
             </div>
           </div>
           <div class="muted meta">
-            {formatCount(current.downloads)} pobrań
-            {#if details?.followers} · {formatCount(details.followers)} obserwujących{/if}
-            {#if details?.updated} · aktualizacja: {details.updated}{/if}
-            {#if details?.license} · licencja: {details.license}{/if}
-            {#if details?.categories?.length}<br />Kategorie: {details.categories.slice(0, 8).join(", ")}{/if}
+            {formatCount(current.downloads)} {t("downloads", "pobrań")}
+            {#if details?.followers} · {formatCount(details.followers)} {t("followers", "obserwujących")}{/if}
+            {#if details?.updated} · {t("updated", "aktualizacja")}: {details.updated}{/if}
+            {#if details?.license} · {t("license", "licencja")}: {details.license}{/if}
+            {#if details?.categories?.length}<br />{t("Categories", "Kategorie")}: {details.categories.slice(0, 8).join(", ")}{/if}
           </div>
           <div class="links">
-            {#each details?.links ?? (current.url ? [["Strona projektu", current.url]] : []) as [label, url]}
+            {#each details?.links ?? (current.url ? [[t("Project page", "Strona projektu"), current.url]] : []) as [label, url]}
               <button onclick={() => invoke("open_url", { url })}>{label}</button>
             {/each}
           </div>
           <div class="desc">
-            {#if details}{plainText(details.description) || "Brak opisu."}
-            {:else if detailsError}{current.description || "Nie udało się wczytać opisu."}
-            {:else}{current.description}<br /><br /><span class="muted">Wczytuję pełny opis…</span>{/if}
+            {#if details}{plainText(details.description) || t("No description.", "Brak opisu.")}
+            {:else if detailsError}{current.description || t("Could not load the description.", "Nie udało się wczytać opisu.")}
+            {:else}{current.description}<br /><br /><span class="muted">{t("Loading the full description…", "Wczytuję pełny opis…")}</span>{/if}
           </div>
           {#if kind === "datapack"}
             {#if worlds.length}
-              <label>Świat
+              <label>{t("World", "Świat")}
                 <select bind:value={world}>{#each worlds as w}<option value={w}>{w}</option>{/each}</select>
               </label>
             {:else}
-              <p class="muted small">Ten profil nie ma jeszcze świata. Uruchom grę i utwórz świat.</p>
+              <p class="muted small">{t("This profile has no world yet. Start the game and create one.", "Ten profil nie ma jeszcze świata. Uruchom grę i utwórz świat.")}</p>
             {/if}
           {/if}
           {#if message.text}<p class="msg" class:err={message.error}>{message.text}</p>{/if}
           <button class="primary install" onclick={install} disabled={installing || (kind === "datapack" && !worlds.length)}>
-            {#if installing}Instaluję…
-            {:else if kind === "modpack"}Zainstaluj jako nowy profil
-            {:else if kind === "datapack"}Dodaj do świata
-            {:else if installed.has(current.source + ":" + current.id)}Zainstaluj ponownie / zaktualizuj
-            {:else}Zainstaluj{/if}
+            {#if installing}{t("Installing…", "Instaluję…")}
+            {:else if kind === "modpack"}{t("Install as a new profile", "Zainstaluj jako nowy profil")}
+            {:else if kind === "datapack"}{t("Add to world", "Dodaj do świata")}
+            {:else if installed.has(current.source + ":" + current.id)}{t("Reinstall / update", "Zainstaluj ponownie / zaktualizuj")}
+            {:else}{t("Install", "Zainstaluj")}{/if}
           </button>
         {:else}
-          <p class="muted">Wybierz pozycję z listy, żeby zobaczyć opis.</p>
+          <p class="muted">{t("Pick an item from the list to see its description.", "Wybierz pozycję z listy, żeby zobaczyć opis.")}</p>
         {/if}
       </aside>
     </div>
@@ -244,11 +259,11 @@
     <div class="bottom">
       <span class="info" class:err={info.error}>{info.text}</span>
       <span class="muted">
-        {#if kind === "modpack"}Modpack zostanie zainstalowany jako nowy profil
-        {:else if kind === "datapack"}Paczka danych trafi do wybranego świata
-        {:else}Instalacja do profilu „{profile.name}”{/if}
+        {#if kind === "modpack"}{t("The modpack will be installed as a new profile", "Modpack zostanie zainstalowany jako nowy profil")}
+        {:else if kind === "datapack"}{t("The data pack goes into the chosen world", "Paczka danych trafi do wybranego świata")}
+        {:else}{t(`Installing into profile “${profile.name}”`, `Instalacja do profilu „${profile.name}”`)}{/if}
       </span>
-      <button onclick={onclose}>Zamknij</button>
+      <button onclick={onclose}>{t("Close", "Zamknij")}</button>
     </div>
   </div>
 </div>

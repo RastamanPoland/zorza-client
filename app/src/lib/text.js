@@ -1,3 +1,5 @@
+import { i18n, t } from "./i18n.svelte.js";
+
 // Opis z Modrinth (Markdown) albo CurseForge (HTML) jako zwykły tekst.
 export function plainText(raw) {
   let t = String(raw || "");
@@ -21,13 +23,19 @@ export function plainText(raw) {
 }
 
 export function formatCount(n) {
-  for (const [limit, suffix] of [[1e6, " mln"], [1e3, " tys."]]) {
-    if (n >= limit) return (n / limit).toFixed(1).replace(/\.0$/, "").replace(".", ",") + suffix;
+  const pl = i18n.lang === "pl";
+  const units = pl ? [[1e6, " mln"], [1e3, " tys."]] : [[1e6, "M"], [1e3, "K"]];
+  for (const [limit, suffix] of units) {
+    if (n >= limit) {
+      const value = (n / limit).toFixed(1).replace(/\.0$/, "");
+      return (pl ? value.replace(".", ",") : value) + suffix;
+    }
   }
   return String(n);
 }
 
 export function pluralMods(n) {
+  if (i18n.lang !== "pl") return n === 1 ? "1 mod" : `${n} mods`;
   if (n === 1) return "1 mod";
   if ([2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100)) return `${n} mody`;
   return `${n} modów`;

@@ -173,14 +173,14 @@ pub async fn release_versions(client: &reqwest::Client) -> Result<Vec<String>, S
 async fn resolve_version(client: &reqwest::Client, cfg: &LaunchCfg, rep: &dyn Reporter) -> Result<Value, String> {
     let manifest = get_json(client, MANIFEST_URL).await?;
     let vid = if cfg.game_version == "latest" {
-        manifest["latest"]["release"].as_str().ok_or("Brak najnowszej wersji w manifeście")?.to_string()
+        manifest["latest"]["release"].as_str().ok_or_else(|| tr!("No latest version in the manifest", "Brak najnowszej wersji w manifeście"))?.to_string()
     } else {
         cfg.game_version.clone()
     };
     let entry = arr(&manifest["versions"])
         .into_iter()
         .find(|v| v["id"] == vid.as_str())
-        .ok_or_else(|| format!("Nie ma wersji {vid} w manifeście Mojangu"))?;
+        .ok_or_else(|| tr!("Version {vid} is not in the Mojang manifest", "Nie ma wersji {vid} w manifeście Mojangu"))?;
     let vfile = versions().join(&vid).join(format!("{vid}.json"));
     download(
         client,
@@ -193,9 +193,9 @@ async fn resolve_version(client: &reqwest::Client, cfg: &LaunchCfg, rep: &dyn Re
     )
     .await?;
     let text = std::fs::read_to_string(&vfile).map_err(|e| e.to_string())?;
-    let mut v: Value = serde_json::from_str(&text).map_err(|e| format!("Uszkodzony plik wersji: {e}"))?;
+    let mut v: Value = serde_json::from_str(&text).map_err(|e| tr!("Damaged version file: {e}", "Uszkodzony plik wersji: {e}"))?;
     if v["arguments"].is_null() {
-        return Err("Ta wersja gry jest za stara (obsługiwane 1.19+)".into());
+        return Err(tr!("This game version is too old (1.19+ is supported)", "Ta wersja gry jest za stara (obsługiwane 1.19+)"));
     }
     v["_id"] = json!(vid);
     v["_mc"] = json!(vid);
@@ -205,12 +205,12 @@ async fn resolve_version(client: &reqwest::Client, cfg: &LaunchCfg, rep: &dyn Re
             let (meta, label) = if fabric { (FABRIC_META, "Fabric Loader") } else { (QUILT_META, "Quilt Loader") };
             let loaders = arr(&get_json(client, &format!("{meta}/versions/loader/{}", enc(&vid))).await?);
             if loaders.is_empty() {
-                return Err(format!("{label} nie wspiera jeszcze wersji {vid}. Wybierz starszą wersję gry albo inny loader."));
+                return Err(tr!("{label} does not support {vid} yet. Choose an older game version or another loader.", "{label} nie wspiera jeszcze wersji {vid}. Wybierz starszą wersję gry albo inny loader."));
             }
             let version_of = |l: &Value| l["loader"]["version"].as_str().unwrap_or_default().to_string();
             let pinned = loaders.iter().find(|l| !cfg.loader_version.is_empty() && version_of(l) == cfg.loader_version);
             if !cfg.loader_version.is_empty() && pinned.is_none() {
-                rep.status(&format!("{label} {} nie pasuje do wersji {vid}, używam najnowszego", cfg.loader_version));
+                rep.status(&tr!("{label} {} does not match {vid}, using the latest", "{label} {} nie pasuje do wersji {vid}, używam najnowszego", cfg.loader_version));
             }
             let pick = pinned
                 .or_else(|| {
@@ -314,14 +314,14 @@ async fn forge_like_version(client: &reqwest::Client, loader: &str, mc: &str, pi
             .as_str()
             .or_else(|| promos[format!("{mc}-latest").as_str()].as_str())
             .map(str::to_string)
-            .ok_or_else(|| format!("Forge nie ma jeszcze wersji dla Minecraft {mc}"));
+            .ok_or_else(|| tr!("Forge has no version for Minecraft {mc} yet", "Forge nie ma jeszcze wersji dla Minecraft {mc}"));
     }
     let list = loader_versions(client, "neoforge", mc).await?;
     list.iter()
         .find(|l| l.stable)
         .or(list.first())
         .map(|l| l.version.clone())
-        .ok_or_else(|| format!("NeoForge nie ma jeszcze wersji dla Minecraft {mc}"))
+        .ok_or_else(|| tr!("NeoForge has no version for Minecraft {mc} yet", "NeoForge nie ma jeszcze wersji dla Minecraft {mc}"))
 }
 
 /// Uruchamia oficjalny instalator Forge/NeoForge bez okna. Zwraca (wersja, json wersji).
@@ -337,7 +337,7 @@ async fn install_forge_like(
     let label = if loader == "forge" { "Forge" } else { "NeoForge" };
     let version = forge_like_version(client, loader, mc, pin).await?;
     if !version.chars().all(|c| c.is_ascii_alphanumeric() || ".-+_".contains(c)) {
-        return Err(format!("Nieprawidłowa wersja {label}: {version}"));
+        return Err(tr!("Invalid {label} version: {version}", "Nieprawidłowa wersja {label}: {version}"));
     }
     let url = if loader == "forge" {
         format!("{FORGE_MAVEN}/{mc}-{version}/forge-{mc}-{version}-installer.jar")
@@ -345,10 +345,10 @@ async fn install_forge_like(
         format!("{NEOFORGE_MAVEN}/{version}/neoforge-{version}-installer.jar")
     };
     let installer = root_dir().join("cache").join("installers").join(url.rsplit('/').next().unwrap_or("installer.jar"));
-    rep.status(&format!("Pobieram instalator {label} {version}…"));
+    rep.status(&tr!("Downloading the {label} {version} installer…", "Pobieram instalator {label} {version}…"));
     download(client, &Task { url, dest: installer.clone(), sha1: None, size: None })
         .await
-        .map_err(|e| format!("{e}. Sprawdź, czy {label} {version} istnieje dla Minecraft {mc}."))?;
+        .map_err(|e| tr!("{e}. Check that {label} {version} exists for Minecraft {mc}.", "{e}. Sprawdź, czy {label} {version} istnieje dla Minecraft {mc}."))?;
     let vid = (|| {
         let mut zip = zip::ZipArchive::new(std::fs::File::open(&installer).ok()?).ok()?;
         let mut text = String::new();
@@ -358,10 +358,10 @@ async fn install_forge_like(
     })();
     let Some(vid) = vid else {
         let _ = std::fs::remove_file(&installer);
-        return Err(format!("Instalator {label} {version} jest uszkodzony, spróbuj ponownie"));
+        return Err(tr!("The {label} {version} installer is damaged, try again", "Instalator {label} {version} jest uszkodzony, spróbuj ponownie"));
     };
     if vid.is_empty() || vid.contains('/') || vid.contains('\\') || vid.starts_with('.') {
-        return Err(format!("Nieoczekiwana nazwa wersji w instalatorze {label}: {vid}"));
+        return Err(tr!("Unexpected version name in the {label} installer: {vid}", "Nieoczekiwana nazwa wersji w instalatorze {label}: {vid}"));
     }
     let vjson = versions().join(&vid).join(format!("{vid}.json"));
     if !vjson.exists() {
@@ -370,7 +370,7 @@ async fn install_forge_like(
             std::fs::write(&profiles_file, r#"{"profiles":{}}"#).map_err(|e| e.to_string())?;
         }
         let java = ensure_java(client, vanilla, cfg, rep).await?;
-        rep.status(&format!("Instaluję {label} {version}. Za pierwszym razem może to potrwać kilka minut…"));
+        rep.status(&tr!("Installing {label} {version}. The first time this can take a few minutes…", "Instaluję {label} {version}. Za pierwszym razem może to potrwać kilka minut…"));
         let root = root_dir();
         let dir = installer.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
         let installer_path = installer.clone();
@@ -386,12 +386,13 @@ async fn install_forge_like(
         })
         .await
         .map_err(|e| e.to_string())?
-        .map_err(|e| format!("Nie udało się uruchomić instalatora {label}: {e}"))?;
+        .map_err(|e| tr!("Could not start the {label} installer: {e}", "Nie udało się uruchomić instalatora {label}: {e}"))?;
         if !output.status.success() || !vjson.exists() {
             let out = String::from_utf8_lossy(&output.stdout);
             let err = String::from_utf8_lossy(&output.stderr);
             let tail = |t: &str, n: usize| t.chars().rev().take(n).collect::<String>().chars().rev().collect::<String>();
-            return Err(format!(
+            return Err(tr!(
+                "The {label} installer failed (code {:?}):\n{}{}",
                 "Instalator {label} zakończył się błędem (kod {:?}):\n{}{}",
                 output.status.code(),
                 tail(&out, 1200),
@@ -400,7 +401,7 @@ async fn install_forge_like(
         }
     }
     let text = std::fs::read_to_string(&vjson).map_err(|e| e.to_string())?;
-    let child: Value = serde_json::from_str(&text).map_err(|e| format!("Uszkodzony plik wersji {label}: {e}"))?;
+    let child: Value = serde_json::from_str(&text).map_err(|e| tr!("Damaged {label} version file: {e}", "Uszkodzony plik wersji {label}: {e}"))?;
     Ok((version, child))
 }
 
@@ -463,7 +464,7 @@ fn collect_libraries(v: &Value) -> (Vec<Task>, Vec<PathBuf>, Vec<PathBuf>) {
 
 async fn collect_assets(client: &reqwest::Client, v: &Value) -> Result<Vec<Task>, String> {
     let idx = &v["assetIndex"];
-    let id = idx["id"].as_str().ok_or("Brak indeksu zasobów")?;
+    let id = idx["id"].as_str().ok_or_else(|| tr!("No asset index", "Brak indeksu zasobów"))?;
     let idx_file = assets().join("indexes").join(format!("{id}.json"));
     download(
         client,
@@ -516,12 +517,12 @@ async fn ensure_java(client: &reqwest::Client, v: &Value, cfg: &LaunchCfg, rep: 
     let major = v["javaVersion"]["majorVersion"].as_u64().map(|m| m.to_string()).unwrap_or("?".into());
     let exe = if cfg!(windows) { "java.exe" } else { "java" };
     let Some(key) = java_platform_key() else {
-        return Err(format!("Mojang nie ma Javy {major} dla tego systemu. Zainstaluj ją i wpisz ścieżkę w Ustawieniach."));
+        return Err(tr!("Mojang has no Java {major} for this system. Install it and enter its path in Settings.", "Mojang nie ma Javy {major} dla tego systemu. Zainstaluj ją i wpisz ścieżkę w Ustawieniach."));
     };
     let all = get_json(client, JAVA_RUNTIMES_URL).await?;
     let entries = arr(&all[key][component.as_str()]);
     let Some(entry) = entries.first() else {
-        return Err(format!("Mojang nie ma Javy {major} dla tego systemu. Zainstaluj ją i wpisz ścieżkę w Ustawieniach."));
+        return Err(tr!("Mojang has no Java {major} for this system. Install it and enter its path in Settings.", "Mojang nie ma Javy {major} dla tego systemu. Zainstaluj ją i wpisz ścieżkę w Ustawieniach."));
     };
     let home = root_dir().join("runtimes").join(&component).join(key);
     let manifest = get_json(client, entry["manifest"]["url"].as_str().unwrap_or_default()).await?;
@@ -576,7 +577,7 @@ async fn ensure_java(client: &reqwest::Client, v: &Value, cfg: &LaunchCfg, rep: 
             return Ok(candidate.display().to_string());
         }
     }
-    Err("Pobrano Javę, ale nie znaleziono pliku wykonywalnego".into())
+    Err(tr!("Java was downloaded, but its executable was not found", "Pobrano Javę, ale nie znaleziono pliku wykonywalnego"))
 }
 
 /// Wypakowuje natywne biblioteki LWJGL (dll/so/dylib) z jarow do folderu natives.
@@ -697,9 +698,9 @@ fn substitute(s: &str, values: &HashMap<&str, String>) -> String {
 pub async fn prepare(cfg: &LaunchCfg, account: &Account, game_dir: &Path, rep: &dyn Reporter) -> Result<Vec<String>, String> {
     let client = crate::net::client()?;
     for d in [libs(), assets(), versions(), game_dir.join("mods")] {
-        std::fs::create_dir_all(&d).map_err(|e| format!("Nie można utworzyć {}: {e}", d.display()))?;
+        std::fs::create_dir_all(&d).map_err(|e| tr!("Cannot create {}: {e}", "Nie można utworzyć {}: {e}", d.display()))?;
     }
-    rep.status("Sprawdzam wersję…");
+    rep.status(&tr!("Checking the version…", "Sprawdzam wersję…"));
     let v = resolve_version(&client, cfg, rep).await?;
     let mc = v["_mc"].as_str().unwrap_or_default().to_string();
     let loader = v["_loader"].as_array().map(|l| {
@@ -709,15 +710,15 @@ pub async fn prepare(cfg: &LaunchCfg, account: &Account, game_dir: &Path, rep: &
     let (mut tasks, classpath, natives) = collect_libraries(&v);
     let client_dl = &v["downloads"]["client"];
     tasks.push(Task {
-        url: client_dl["url"].as_str().ok_or("Brak pliku gry w opisie wersji")?.to_string(),
+        url: client_dl["url"].as_str().ok_or_else(|| tr!("No game file in the version description", "Brak pliku gry w opisie wersji"))?.to_string(),
         dest: versions().join(&mc).join(format!("{mc}.jar")),
         sha1: client_dl["sha1"].as_str().map(str::to_string),
         size: client_dl["size"].as_u64(),
     });
-    rep.status("Pobieram biblioteki i grę…");
+    rep.status(&tr!("Downloading libraries and the game…", "Pobieram biblioteki i grę…"));
     download_all(&client, tasks, 12, |d, t| rep.progress(d, t)).await?;
     if let Some(missing) = classpath.iter().find(|p| !p.exists()) {
-        return Err(format!("Brakuje biblioteki {}", missing.display()));
+        return Err(tr!("Missing library {}", "Brakuje biblioteki {}", missing.display()));
     }
     let vid = v["_id"].as_str().unwrap_or_default().to_string();
     let jar = versions().join(&vid).join(format!("{vid}.jar"));
@@ -725,7 +726,7 @@ pub async fn prepare(cfg: &LaunchCfg, account: &Account, game_dir: &Path, rep: &
         // jak oficjalny launcher: gra pod nazwa wersji z loaderem
         std::fs::copy(versions().join(&mc).join(format!("{mc}.jar")), &jar).map_err(|e| e.to_string())?;
     }
-    rep.status("Pobieram zasoby…");
+    rep.status(&tr!("Downloading assets…", "Pobieram zasoby…"));
     let asset_tasks = collect_assets(&client, &v).await?;
     download_all(&client, asset_tasks, 16, |d, t| rep.progress(d, t)).await?;
     let java = ensure_java(&client, &v, cfg, rep).await?;

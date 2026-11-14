@@ -138,11 +138,11 @@ fn arr(v: &Value) -> Vec<Value> {
 
 async fn cf_send(req: reqwest::RequestBuilder, key: &str) -> Result<Value, String> {
     if key.is_empty() {
-        return Err("Brak klucza API CurseForge. Wpisz własny w Ustawieniach albo użyj Modrinth.".into());
+        return Err(tr!("No CurseForge API key. Enter your own in Settings or use Modrinth.", "Brak klucza API CurseForge. Wpisz własny w Ustawieniach albo użyj Modrinth."));
     }
     let resp = req.header("x-api-key", key).header("Accept", "application/json").send().await.map_err(|e| e.to_string())?;
     match resp.status().as_u16() {
-        401 | 403 => Err("CurseForge odrzucił klucz API (sprawdź go w Ustawieniach)".into()),
+        401 | 403 => Err(tr!("CurseForge rejected the API key (check it in Settings)", "CurseForge odrzucił klucz API (sprawdź go w Ustawieniach)")),
         _ => resp.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string()),
     }
 }
@@ -165,7 +165,7 @@ fn safe_file_name(name: &str, exts: &[&str]) -> Result<String, String> {
     let base = name.rsplit('/').next().unwrap_or_default().to_string();
     let lower = base.to_lowercase();
     if base.is_empty() || base.starts_with('.') || !exts.iter().any(|e| lower.ends_with(e)) {
-        return Err(format!("Nieoczekiwana nazwa pliku: {base}"));
+        return Err(tr!("Unexpected file name: {base}", "Nieoczekiwana nazwa pliku: {base}"));
     }
     Ok(base)
 }
@@ -173,7 +173,7 @@ fn safe_file_name(name: &str, exts: &[&str]) -> Result<String, String> {
 /// Sciezka z paczki, ktora nie moze wyjsc poza folder profilu.
 pub fn safe_join(base: &Path, rel: &str) -> Result<PathBuf, String> {
     let rel = rel.replace('\\', "/");
-    let bad = || format!("Niebezpieczna ścieżka w paczce: {rel}");
+    let bad = || tr!("Unsafe path in pack: {rel}", "Niebezpieczna ścieżka w paczce: {rel}");
     if rel.starts_with('/') || rel.len() > 1 && rel.as_bytes()[1] == b':' {
         return Err(bad());
     }
@@ -240,7 +240,7 @@ async fn store_file(
     version: &str,
 ) -> Result<(), String> {
     if !url.starts_with("https://") {
-        return Err("Odrzucono adres pobierania, który nie używa HTTPS".into());
+        return Err(tr!("Rejected a download address that does not use HTTPS", "Odrzucono adres pobierania, który nie używa HTTPS"));
     }
     let name = safe_file_name(filename, exts)?;
     let mut index = load_index(index_path);
@@ -317,7 +317,7 @@ pub async fn search(
     let client = crate::net::client()?;
     let version = if kind == "modpack" { "" } else { game_version };
     if kind == "mod" && mr_loaders(loader).is_empty() {
-        return Err("Ten profil nie ma loadera modów. Wybierz Fabric, Quilt, Forge albo NeoForge w edycji profilu.".into());
+        return Err(tr!("This profile has no mod loader. Choose Fabric, Quilt, Forge or NeoForge in the profile editor.", "Ten profil nie ma loadera modów. Wybierz Fabric, Quilt, Forge albo NeoForge w edycji profilu."));
     }
     if source == "modrinth" {
         let mut facets: Vec<Vec<String>> = match kind {
@@ -377,8 +377,8 @@ pub async fn search(
 
 pub async fn details(hit: &Hit) -> Result<Details, String> {
     let client = crate::net::client()?;
-    let https = |l: Vec<(&str, String)>| -> Vec<(String, String)> {
-        l.into_iter().filter(|(_, u)| u.starts_with("https://")).map(|(a, b)| (a.to_string(), b)).collect()
+    let https = |l: Vec<(String, String)>| -> Vec<(String, String)> {
+        l.into_iter().filter(|(_, u)| u.starts_with("https://")).collect()
     };
     if hit.source == "modrinth" {
         let p = get_json(&client, &format!("{MODRINTH}/project/{}", enc(&hit.id))).await?;
@@ -390,15 +390,15 @@ pub async fn details(hit: &Hit) -> Result<Details, String> {
             license: p["license"]["name"].as_str().filter(|x| !x.is_empty()).map(str::to_string).unwrap_or_else(|| s(&p["license"]["id"])),
             followers: p["followers"].as_u64(),
             links: https(vec![
-                ("Strona projektu", hit.url.clone()),
-                ("Kod źródłowy", s(&p["source_url"])),
-                ("Zgłoś błąd", s(&p["issues_url"])),
-                ("Wiki", s(&p["wiki_url"])),
-                ("Discord", s(&p["discord_url"])),
+                (tr!("Project page", "Strona projektu"), hit.url.clone()),
+                (tr!("Source code", "Kod źródłowy"), s(&p["source_url"])),
+                (tr!("Report a bug", "Zgłoś błąd"), s(&p["issues_url"])),
+                ("Wiki".to_string(), s(&p["wiki_url"])),
+                ("Discord".to_string(), s(&p["discord_url"])),
             ]),
         });
     }
-    let id: u64 = hit.id.parse().map_err(|_| "Nieprawidłowe ID projektu")?;
+    let id: u64 = hit.id.parse().map_err(|_| tr!("Invalid project ID", "Nieprawidłowe ID projektu"))?;
     let data = cf_get(&client, &format!("/mods/{id}")).await?["data"].clone();
     let description = match cf_get(&client, &format!("/mods/{id}/description")).await {
         Ok(v) => s(&v["data"]),
@@ -413,10 +413,10 @@ pub async fn details(hit: &Hit) -> Result<Details, String> {
         license: String::new(),
         followers: None,
         links: https(vec![
-            ("Strona projektu", site),
-            ("Kod źródłowy", s(&links["sourceUrl"])),
-            ("Zgłoś błąd", s(&links["issuesUrl"])),
-            ("Wiki", s(&links["wikiUrl"])),
+            (tr!("Project page", "Strona projektu"), site),
+            (tr!("Source code", "Kod źródłowy"), s(&links["sourceUrl"])),
+            (tr!("Report a bug", "Zgłoś błąd"), s(&links["issuesUrl"])),
+            ("Wiki".to_string(), s(&links["wikiUrl"])),
         ]),
     })
 }
@@ -433,7 +433,7 @@ async fn modrinth_pick(client: &reqwest::Client, id: &str, loaders: &[&str], gam
 }
 
 async fn cf_pick(client: &reqwest::Client, id: &str, game_version: &str, loader: Option<u32>) -> Result<Option<Value>, String> {
-    let id: u64 = id.parse().map_err(|_| "Nieprawidłowe ID projektu")?;
+    let id: u64 = id.parse().map_err(|_| tr!("Invalid project ID", "Nieprawidłowe ID projektu"))?;
     let mut params = vec![("pageSize", "50".to_string())];
     if !game_version.is_empty() {
         params.push(("gameVersion", game_version.to_string()));
@@ -453,13 +453,13 @@ fn primary_file(version: &Value, title: &str) -> Result<Value, String> {
         .find(|f| f["primary"].as_bool() == Some(true))
         .or(files.first())
         .cloned()
-        .ok_or_else(|| format!("„{title}” nie ma pliku do pobrania"))
+        .ok_or_else(|| tr!("“{title}” has no file to download", "„{title}” nie ma pliku do pobrania"))
 }
 
 /// Instaluje mod razem z wymaganymi zaleznosciami. Zwraca nazwy zainstalowanych modow.
 pub async fn install_mod(hit: &Hit, game_version: &str, game_dir: &Path, loader: &str) -> Result<Vec<String>, String> {
     if mr_loaders(loader).is_empty() {
-        return Err("Ten profil nie ma loadera modów. Wybierz Fabric, Quilt, Forge albo NeoForge.".into());
+        return Err(tr!("This profile has no mod loader. Choose Fabric, Quilt, Forge or NeoForge.", "Ten profil nie ma loadera modów. Wybierz Fabric, Quilt, Forge albo NeoForge."));
     }
     let client = crate::net::client()?;
     let mods_dir = game_dir.join("mods");
@@ -480,7 +480,7 @@ pub async fn install_mod(hit: &Hit, game_version: &str, game_dir: &Path, loader:
                 };
                 let ver = modrinth_pick(&client, &id, &mr_loaders(loader), game_version)
                     .await?
-                    .ok_or_else(|| format!("„{title}” nie ma wersji dla Minecraft {game_version} z {label}"))?;
+                    .ok_or_else(|| tr!("“{title}” has no version for Minecraft {game_version} with {label}", "„{title}” nie ma wersji dla Minecraft {game_version} z {label}"))?;
                 let f = primary_file(&ver, &title)?;
                 store_file(&client, &mods_dir, &index, &s(&f["url"]), &s(&f["filename"]), &[".jar"],
                     f["hashes"]["sha1"].as_str().map(str::to_string), f["size"].as_u64(),
@@ -505,10 +505,10 @@ pub async fn install_mod(hit: &Hit, game_version: &str, game_dir: &Path, loader:
                 };
                 let f = cf_pick(&client, &id, game_version, cf_loader(loader))
                     .await?
-                    .ok_or_else(|| format!("„{title}” nie ma wersji dla Minecraft {game_version} z {label}"))?;
+                    .ok_or_else(|| tr!("“{title}” has no version for Minecraft {game_version} with {label}", "„{title}” nie ma wersji dla Minecraft {game_version} z {label}"))?;
                 let url = s(&f["downloadUrl"]);
                 if url.is_empty() {
-                    return Err(format!("Autor „{title}” nie pozwala pobierać moda przez zewnętrzne launchery. Pobierz plik ze strony CurseForge i wrzuć go do folderu mods."));
+                    return Err(tr!("The author of “{title}” does not allow downloads through third-party launchers. Download the file from CurseForge and put it in the mods folder.", "Autor „{title}” nie pozwala pobierać moda przez zewnętrzne launchery. Pobierz plik ze strony CurseForge i wrzuć go do folderu mods."));
                 }
                 store_file(&client, &mods_dir, &index, &url, &s(&f["fileName"]), &[".jar"], cf_sha1(&f),
                     f["fileLength"].as_u64(), "curseforge", &id, &title, &s(&f["displayName"])).await?;
@@ -526,7 +526,7 @@ pub async fn install_mod(hit: &Hit, game_version: &str, game_dir: &Path, loader:
         }
         .await;
         if let Err(e) = result {
-            return Err(if names.is_empty() { e } else { format!("{e} (pobrano już: {})", names.join(", ")) });
+            return Err(if names.is_empty() { e } else { tr!("{e} (already downloaded: {})", "{e} (pobrano już: {})", names.join(", ")) });
         }
     }
     Ok(names)
@@ -540,7 +540,7 @@ pub async fn install_pack(hit: &Hit, kind: &str, game_version: &str, target_dir:
         let loaders: &[&str] = if kind == "datapack" { &["datapack"] } else { &["minecraft"] };
         let ver = modrinth_pick(&client, &hit.id, loaders, game_version)
             .await?
-            .ok_or_else(|| format!("„{title}” nie ma wersji dla Minecraft {game_version}"))?;
+            .ok_or_else(|| tr!("“{title}” has no version for Minecraft {game_version}", "„{title}” nie ma wersji dla Minecraft {game_version}"))?;
         let f = primary_file(&ver, &title)?;
         store_file(&client, target_dir, index_path, &s(&f["url"]), &s(&f["filename"]), &[".zip"],
             f["hashes"]["sha1"].as_str().map(str::to_string), f["size"].as_u64(),
@@ -548,10 +548,10 @@ pub async fn install_pack(hit: &Hit, kind: &str, game_version: &str, target_dir:
     } else {
         let f = cf_pick(&client, &hit.id, game_version, None)
             .await?
-            .ok_or_else(|| format!("„{title}” nie ma wersji dla Minecraft {game_version}"))?;
+            .ok_or_else(|| tr!("“{title}” has no version for Minecraft {game_version}", "„{title}” nie ma wersji dla Minecraft {game_version}"))?;
         let url = s(&f["downloadUrl"]);
         if url.is_empty() {
-            return Err(format!("Autor „{title}” nie pozwala pobierać przez zewnętrzne launchery. Pobierz plik ze strony CurseForge."));
+            return Err(tr!("The author of “{title}” does not allow downloads through third-party launchers. Download the file from CurseForge.", "Autor „{title}” nie pozwala pobierać przez zewnętrzne launchery. Pobierz plik ze strony CurseForge."));
         }
         store_file(&client, target_dir, index_path, &url, &s(&f["fileName"]), &[".zip"], cf_sha1(&f),
             f["fileLength"].as_u64(), "curseforge", &hit.id, &title, &s(&f["displayName"])).await?;
@@ -590,15 +590,15 @@ fn extract_overrides(zip: &mut zip::ZipArchive<std::fs::File>, prefix: &str, gam
 
 pub async fn install_modpack_file(path: &Path, game_dir: &Path, rep: &dyn Reporter) -> Result<ModpackInfo, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut zip = zip::ZipArchive::new(file).map_err(|_| "To nie jest prawidłowy plik modpacka".to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|_| tr!("This is not a valid modpack file", "To nie jest prawidłowy plik modpacka"))?;
     std::fs::create_dir_all(game_dir).map_err(|e| e.to_string())?;
     let client = crate::net::client()?;
     if let Some(text) = read_zip_entry(&mut zip, "modrinth.index.json") {
-        let index: Value = serde_json::from_str(&text).map_err(|e| format!("Uszkodzony modrinth.index.json: {e}"))?;
+        let index: Value = serde_json::from_str(&text).map_err(|e| tr!("Damaged modrinth.index.json: {e}", "Uszkodzony modrinth.index.json: {e}"))?;
         let deps = &index["dependencies"];
         let mc = s(&deps["minecraft"]);
         if mc.is_empty() {
-            return Err("Modpack nie podaje wersji Minecrafta".into());
+            return Err(tr!("The modpack does not specify a Minecraft version", "Modpack nie podaje wersji Minecrafta"));
         }
         let (mut loader, mut loader_version) = ("vanilla".to_string(), String::new());
         for (key, name) in [("fabric-loader", "fabric"), ("quilt-loader", "quilt"), ("forge", "forge"), ("neoforge", "neoforge")] {
@@ -614,7 +614,7 @@ pub async fn install_modpack_file(path: &Path, game_dir: &Path, rep: &dyn Report
                 continue;
             }
             let url = arr(&f["downloads"]).iter().map(s).find(|u| u.starts_with("https://"))
-                .ok_or_else(|| format!("Brak bezpiecznego adresu pobierania dla {}", s(&f["path"])))?;
+                .ok_or_else(|| tr!("No safe download address for {}", "Brak bezpiecznego adresu pobierania dla {}", s(&f["path"])))?;
             tasks.push(Task {
                 url,
                 dest: safe_join(game_dir, &s(&f["path"]))?,
@@ -623,7 +623,7 @@ pub async fn install_modpack_file(path: &Path, game_dir: &Path, rep: &dyn Report
             });
         }
         let files = tasks.len();
-        rep.status(&format!("Pobieram {files} plików modpacka…"));
+        rep.status(&tr!("Downloading {files} modpack files…", "Pobieram {files} plików modpacka…"));
         download_all(&client, tasks, 12, |d, t| rep.progress(d, t)).await?;
         extract_overrides(&mut zip, "overrides", game_dir)?;
         extract_overrides(&mut zip, "client-overrides", game_dir)?;
@@ -639,12 +639,12 @@ pub async fn install_modpack_file(path: &Path, game_dir: &Path, rep: &dyn Report
         });
     }
     let Some(text) = read_zip_entry(&mut zip, "manifest.json") else {
-        return Err("Plik nie zawiera ani modrinth.index.json, ani manifest.json".into());
+        return Err(tr!("The file contains neither modrinth.index.json nor manifest.json", "Plik nie zawiera ani modrinth.index.json, ani manifest.json"));
     };
-    let m: Value = serde_json::from_str(&text).map_err(|e| format!("Uszkodzony manifest.json: {e}"))?;
+    let m: Value = serde_json::from_str(&text).map_err(|e| tr!("Damaged manifest.json: {e}", "Uszkodzony manifest.json: {e}"))?;
     let mc = s(&m["minecraft"]["version"]);
     if mc.is_empty() {
-        return Err("Modpack nie podaje wersji Minecrafta".into());
+        return Err(tr!("The modpack does not specify a Minecraft version", "Modpack nie podaje wersji Minecrafta"));
     }
     let entries = arr(&m["minecraft"]["modLoaders"]);
     let primary = entries.iter().find(|x| x["primary"].as_bool() == Some(true)).or(entries.first()).cloned().unwrap_or(Value::Null);
@@ -653,7 +653,7 @@ pub async fn install_modpack_file(path: &Path, game_dir: &Path, rep: &dyn Report
     if !loader_id.is_empty() {
         let (name, ver) = loader_id.split_once('-').unwrap_or((loader_id.as_str(), ""));
         if mr_loaders(name).is_empty() {
-            return Err(format!("Ten modpack wymaga loadera {loader_id}, którego Zorza nie obsługuje"));
+            return Err(tr!("This modpack needs the {loader_id} loader, which Zorza does not support", "Ten modpack wymaga loadera {loader_id}, którego Zorza nie obsługuje"));
         }
         loader = name.to_string();
         loader_version = ver.to_string();
@@ -692,7 +692,7 @@ pub async fn install_modpack_file(path: &Path, game_dir: &Path, rep: &dyn Report
         tasks.push(Task { url, dest: game_dir.join(folder).join(&name), sha1: cf_sha1(f), size: f["fileLength"].as_u64() });
     }
     let count = tasks.len();
-    rep.status(&format!("Pobieram {count} plików modpacka…"));
+    rep.status(&tr!("Downloading {count} modpack files…", "Pobieram {count} plików modpacka…"));
     download_all(&client, tasks, 12, |d, t| rep.progress(d, t)).await?;
     let overrides = m["overrides"].as_str().filter(|x| !x.is_empty()).unwrap_or("overrides").to_string();
     extract_overrides(&mut zip, &overrides, game_dir)?;
@@ -715,20 +715,20 @@ pub async fn install_modpack(hit: &Hit, game_dir: &Path, rep: &dyn Reporter) -> 
     let (url, name, sha1, size) = if hit.source == "modrinth" {
         let ver = modrinth_pick(&client, &hit.id, &["fabric", "quilt", "forge", "neoforge"], "")
             .await?
-            .ok_or_else(|| format!("„{title}” nie ma wersji do pobrania"))?;
+            .ok_or_else(|| tr!("“{title}” has no version to download", "„{title}” nie ma wersji do pobrania"))?;
         let f = primary_file(&ver, title)?;
         (s(&f["url"]), safe_file_name(&s(&f["filename"]), &[".mrpack"])?, f["hashes"]["sha1"].as_str().map(str::to_string), f["size"].as_u64())
     } else {
-        let f = cf_pick(&client, &hit.id, "", None).await?.ok_or_else(|| format!("„{title}” nie ma wersji do pobrania"))?;
+        let f = cf_pick(&client, &hit.id, "", None).await?.ok_or_else(|| tr!("“{title}” has no version to download", "„{title}” nie ma wersji do pobrania"))?;
         if s(&f["downloadUrl"]).is_empty() {
-            return Err(format!("Autor „{title}” nie pozwala pobierać modpacka przez zewnętrzne launchery."));
+            return Err(tr!("The author of “{title}” does not allow modpack downloads through third-party launchers.", "Autor „{title}” nie pozwala pobierać modpacka przez zewnętrzne launchery."));
         }
         (s(&f["downloadUrl"]), safe_file_name(&s(&f["fileName"]), &[".zip"])?, cf_sha1(&f), f["fileLength"].as_u64())
     };
     if !url.starts_with("https://") {
-        return Err("Odrzucono adres pobierania, który nie używa HTTPS".into());
+        return Err(tr!("Rejected a download address that does not use HTTPS", "Odrzucono adres pobierania, który nie używa HTTPS"));
     }
-    rep.status(&format!("Pobieram modpack „{title}”…"));
+    rep.status(&tr!("Downloading modpack “{title}”…", "Pobieram modpack „{title}”…"));
     let path = cache.join(&name);
     download(&client, &Task { url, dest: path.clone(), sha1, size }).await?;
     install_modpack_file(&path, game_dir, rep).await
@@ -754,7 +754,7 @@ pub fn list_mods(game_dir: &Path) -> Vec<InstalledFile> {
             out.push(InstalledFile {
                 enabled: file.ends_with(".jar"),
                 title: info["title"].as_str().map(str::to_string).unwrap_or_else(|| base.clone()),
-                source: info["source"].as_str().unwrap_or("ręcznie").to_string(),
+                source: info["source"].as_str().unwrap_or("manual").to_string(),
                 id: s(&info["id"]),
                 file,
                 base,
@@ -780,7 +780,7 @@ pub fn toggle_mod(game_dir: &Path, file: &str) -> Result<bool, String> {
         std::fs::rename(&off, &on).map_err(|e| e.to_string())?;
         Ok(true)
     } else {
-        Err(format!("Nie znaleziono pliku {}", on.display()))
+        Err(tr!("File not found: {}", "Nie znaleziono pliku {}", on.display()))
     }
 }
 
@@ -812,7 +812,7 @@ pub fn list_packs(folder: &Path, index_path: &Path) -> Vec<InstalledFile> {
             let info = index.get(&file).cloned().unwrap_or(Value::Null);
             out.push(InstalledFile {
                 title: info["title"].as_str().map(str::to_string).unwrap_or_else(|| file.clone()),
-                source: info["source"].as_str().unwrap_or("ręcznie").to_string(),
+                source: info["source"].as_str().unwrap_or("manual").to_string(),
                 id: s(&info["id"]),
                 base: file.clone(),
                 enabled: true,
@@ -826,7 +826,7 @@ pub fn list_packs(folder: &Path, index_path: &Path) -> Vec<InstalledFile> {
 
 pub fn remove_pack(folder: &Path, index_path: &Path, name: &str) -> Result<(), String> {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name == "." || name == ".." {
-        return Err(format!("Nieprawidłowa nazwa: {name}"));
+        return Err(tr!("Invalid name: {name}", "Nieprawidłowa nazwa: {name}"));
     }
     let path = folder.join(name);
     if path.is_dir() {

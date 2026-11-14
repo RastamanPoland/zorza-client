@@ -24,7 +24,7 @@ fn write_json(path: &Path, v: &Value) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     let text = serde_json::to_string_pretty(v).map_err(|e| e.to_string())?;
-    std::fs::write(path, text).map_err(|e| format!("Nie można zapisać {}: {e}", path.display()))
+    std::fs::write(path, text).map_err(|e| tr!("Cannot save {}: {e}", "Nie można zapisać {}: {e}", path.display()))
 }
 
 pub fn safe_pid(pid: &str) -> bool {
@@ -43,7 +43,7 @@ pub fn load_profiles() -> Value {
     let mut data = read_json(&profiles_file()).filter(|v| v["profiles"].as_object().is_some_and(|p| !p.is_empty()));
     let mut changed = data.is_none();
     let mut data = data.take().unwrap_or_else(|| {
-        json!({"selected": "default", "profiles": {"default": {"name": "Domyślny", "game_version": "latest", "loader": "fabric"}}})
+        json!({"selected": "default", "profiles": {"default": {"name": tr!("Default", "Domyślny"), "game_version": "latest", "loader": "fabric"}}})
     });
     if let Some(profiles) = data["profiles"].as_object_mut() {
         for p in profiles.values_mut() {
@@ -78,16 +78,16 @@ pub fn load_profiles() -> Value {
 }
 
 pub fn save_profiles(data: &Value) -> Result<(), String> {
-    let profiles = data["profiles"].as_object().ok_or("Nieprawidłowe dane profili")?;
+    let profiles = data["profiles"].as_object().ok_or_else(|| tr!("Invalid profile data", "Nieprawidłowe dane profili"))?;
     if profiles.is_empty() {
-        return Err("Musi zostać co najmniej jeden profil".into());
+        return Err(tr!("At least one profile must remain", "Musi zostać co najmniej jeden profil"));
     }
     for (pid, p) in profiles {
         if pid != "default" && !safe_pid(pid) {
-            return Err(format!("Nieprawidłowy identyfikator profilu: {pid}"));
+            return Err(tr!("Invalid profile ID: {pid}", "Nieprawidłowy identyfikator profilu: {pid}"));
         }
         if !p["name"].is_string() || !p["game_version"].is_string() {
-            return Err("Profil musi mieć nazwę i wersję gry".into());
+            return Err(tr!("A profile needs a name and a game version", "Profil musi mieć nazwę i wersję gry"));
         }
     }
     write_json(&profiles_file(), data)
@@ -99,6 +99,7 @@ pub fn load_config() -> Value {
         ("memory_mb", json!(4096)),
         ("java_path", json!("")),
         ("curseforge_api_key", json!("")),
+        ("language", json!("en")),
     ];
     let obj = cfg.as_object_mut().unwrap();
     for (k, v) in defaults {
@@ -111,14 +112,17 @@ pub fn load_config() -> Value {
 pub fn save_config(update: &Map<String, Value>) -> Result<Value, String> {
     let mut cfg = load_config();
     let obj = cfg.as_object_mut().unwrap();
-    for key in ["memory_mb", "java_path", "curseforge_api_key"] {
+    for key in ["memory_mb", "java_path", "curseforge_api_key", "language"] {
         if let Some(v) = update.get(key) {
             obj.insert(key.into(), v.clone());
         }
     }
+    if !matches!(obj["language"].as_str(), Some("en" | "pl")) {
+        obj.insert("language".into(), json!("en"));
+    }
     let ram = obj["memory_mb"].as_u64().unwrap_or(0);
     if !(1024..=65536).contains(&ram) {
-        return Err("Pamięć RAM musi być w zakresie 1024–65536 MB".into());
+        return Err(tr!("RAM must be between 1024 and 65536 MB", "Pamięć RAM musi być w zakresie 1024–65536 MB"));
     }
     write_json(&config_file(), &cfg)?;
     Ok(cfg)
@@ -127,7 +131,7 @@ pub fn save_config(update: &Map<String, Value>) -> Result<Value, String> {
 /// Kopia folderu profilu bez logow i raportow bledow.
 pub fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     if dst.exists() {
-        return Err(format!("Folder {} już istnieje", dst.display()));
+        return Err(tr!("Folder {} already exists", "Folder {} już istnieje", dst.display()));
     }
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     if !src.exists() {

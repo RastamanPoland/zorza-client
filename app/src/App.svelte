@@ -4,23 +4,19 @@
   import { onMount } from "svelte";
   import Downloader from "./Downloader.svelte";
   import { pluralMods } from "./lib/text.js";
+  import { i18n, t } from "./lib/i18n.svelte.js";
 
-  const LOADERS = [
-    ["vanilla", "Vanilla (bez modów)"],
-    ["fabric", "Fabric"],
-    ["quilt", "Quilt"],
-    ["forge", "Forge"],
-    ["neoforge", "NeoForge"],
-  ];
-  const LOADER_NAME = Object.fromEntries(LOADERS);
+  const LOADER_IDS = ["vanilla", "fabric", "quilt", "forge", "neoforge"];
+  const LOADER_NAME = { vanilla: "Vanilla", fabric: "Fabric", quilt: "Quilt", forge: "Forge", neoforge: "NeoForge" };
+  const loaderLabel = (id) => (id === "vanilla" ? t("Vanilla (no mods)", "Vanilla (bez modów)") : LOADER_NAME[id]);
   const PALETTE = ["#3ddc97", "#2bc4c9", "#8b5cf6", "#d16ba5", "#f2a65a", "#5b8def"];
 
   let info = $state(null);
-  let status = $state({ text: "Uruchamianie…", error: false });
+  let status = $state({ text: "…", error: false });
   let progress = $state(0);
   let versions = $state(["latest"]);
   let data = $state({ selected: "default", profiles: {} });
-  let config = $state({ memory_mb: 4096, java_path: "", curseforge_api_key: "" });
+  let config = $state({ memory_mb: 4096, java_path: "", curseforge_api_key: "", language: "en" });
 
   // gra
   let busyPid = $state(null); // profil, który się uruchamia
@@ -51,7 +47,7 @@
 
   function setStatus(text, error = false) {
     status = { text, error };
-    addLog((error ? "BŁĄD: " : "") + text);
+    addLog((error ? t("ERROR: ", "BŁĄD: ") : "") + text);
   }
 
   function addLog(line) {
@@ -66,7 +62,7 @@
   }
 
   function versionLabel(p) {
-    const v = p.game_version === "latest" ? "najnowsza" : p.game_version;
+    const v = p.game_version === "latest" ? t("latest", "najnowsza") : p.game_version;
     return p.loader && p.loader !== "vanilla" ? `${v} · ${LOADER_NAME[p.loader]}` : v;
   }
 
@@ -122,7 +118,7 @@
   async function toggleMod(m) {
     try {
       const on = await invoke("toggle_mod", { pid: dialog.pid, file: m.file });
-      editMsg = { text: `${on ? "Włączono" : "Wyłączono"}: ${m.title}`, error: false };
+      editMsg = { text: `${on ? t("Enabled", "Włączono") : t("Disabled", "Wyłączono")}: ${m.title}`, error: false };
     } catch (e) {
       editMsg = { text: String(e), error: true };
     }
@@ -130,10 +126,10 @@
   }
 
   async function removeMod(m) {
-    if (!confirm(`Usunąć ${m.base} z profilu?`)) return;
+    if (!confirm(t(`Remove ${m.base} from the profile?`, `Usunąć ${m.base} z profilu?`))) return;
     try {
       await invoke("remove_mod", { pid: dialog.pid, file: m.file });
-      editMsg = { text: `Usunięto: ${m.title}`, error: false };
+      editMsg = { text: `${t("Removed", "Usunięto")}: ${m.title}`, error: false };
     } catch (e) {
       editMsg = { text: String(e), error: true };
     }
@@ -141,10 +137,10 @@
   }
 
   async function removePack(m) {
-    if (!confirm(`Usunąć ${m.file} z profilu?`)) return;
+    if (!confirm(t(`Remove ${m.file} from the profile?`, `Usunąć ${m.file} z profilu?`))) return;
     try {
       await invoke("remove_resourcepack", { pid: dialog.pid, file: m.file });
-      editMsg = { text: `Usunięto: ${m.title}`, error: false };
+      editMsg = { text: `${t("Removed", "Usunięto")}: ${m.title}`, error: false };
     } catch (e) {
       editMsg = { text: String(e), error: true };
     }
@@ -157,11 +153,11 @@
   }
 
   async function startModpack(hit) {
-    if (modpackBusy) return setStatus("Inny modpack właśnie się instaluje.", true);
+    if (modpackBusy) return setStatus(t("Another modpack is being installed.", "Inny modpack właśnie się instaluje."), true);
     const pid = newId(hit.title);
     modpackBusy = true;
     progress = 0;
-    setStatus(`Instaluję modpack „${hit.title}”…`);
+    setStatus(t(`Installing modpack “${hit.title}”…`, `Instaluję modpack „${hit.title}”…`));
     try {
       const info = await invoke("install_modpack", { pid, hit });
       const name = (info.name || hit.title).slice(0, 40);
@@ -171,14 +167,20 @@
       data.profiles[pid] = p;
       data.selected = pid;
       await saveProfiles();
-      const msg = `Zainstalowano modpack „${name}” jako nowy profil (${info.files} plików)`;
+      const msg = t(
+        `Installed modpack “${name}” as a new profile (${info.files} files)`,
+        `Zainstalowano modpack „${name}” jako nowy profil (${info.files} plików)`,
+      );
       setStatus(msg);
       const notes = [];
-      if (info.missing) notes.push(`${info.missing} plików z tego modpacka nie ma już na CurseForge.`);
+      if (info.missing) notes.push(t(`${info.missing} files of this modpack are no longer on CurseForge.`, `${info.missing} plików z tego modpacka nie ma już na CurseForge.`));
       if (info.blocked.length) {
-        info.blocked.forEach((b) => addLog(`Do pobrania ręcznie: ${b.name} (${b.file}) → ${b.folder} ${b.url}`));
+        info.blocked.forEach((b) => addLog(`${t("Download manually", "Do pobrania ręcznie")}: ${b.name} (${b.file}) → ${b.folder} ${b.url}`));
         notes.push(
-          "Autorzy tych plików nie pozwalają pobierać ich przez launchery. Pobierz je ze strony CurseForge i wrzuć do podanego folderu profilu (linki są w Konsoli):\n" +
+          t(
+            "The authors of these files do not allow downloads through launchers. Download them from CurseForge and put them in the given profile folder (links are in the Console):\n",
+            "Autorzy tych plików nie pozwalają pobierać ich przez launchery. Pobierz je ze strony CurseForge i wrzuć do podanego folderu profilu (linki są w Konsoli):\n",
+          ) +
             info.blocked.slice(0, 15).map((b) => `• ${b.name} (${b.file}) → ${b.folder}`).join("\n"),
         );
       }
@@ -212,10 +214,10 @@
     if (loggingIn) return;
     menu = null;
     loggingIn = true;
-    setStatus("Logowanie…");
+    setStatus(t("Signing in…", "Logowanie…"));
     try {
       account = await invoke("login");
-      setStatus(`Zalogowano jako ${account.name}`);
+      setStatus(t(`Signed in as ${account.name}`, `Zalogowano jako ${account.name}`));
       if (playAfterLogin) {
         const pid = playAfterLogin;
         playAfterLogin = null;
@@ -239,7 +241,7 @@
     menu = null;
     await invoke("logout");
     account = null;
-    setStatus("Wylogowano");
+    setStatus(t("Signed out", "Wylogowano"));
   }
 
   function copyCode() {
@@ -248,7 +250,7 @@
 
   // ------------------------------------------------------------------- gra
   async function play(pid = data.selected) {
-    if (busy) return setStatus("Gra już działa albo właśnie się uruchamia.", true);
+    if (busy) return setStatus(t("The game is already running or starting.", "Gra już działa albo właśnie się uruchamia."), true);
     if (!account) {
       playAfterLogin = pid;
       return login();
@@ -267,7 +269,7 @@
   async function stop() {
     try {
       await invoke("stop_game");
-      setStatus("Zatrzymuję grę…");
+      setStatus(t("Stopping the game…", "Zatrzymuję grę…"));
     } catch (e) {
       setStatus(String(e), true);
     }
@@ -278,7 +280,7 @@
     dialog = {
       kind: "add",
       error: "",
-      form: { name: `Profil ${entries.length + 1}`, game_version: "latest", loader: "fabric", loader_version: "" },
+      form: { name: `${t("Profile", "Profil")} ${entries.length + 1}`, game_version: "latest", loader: "fabric", loader_version: "" },
     };
   }
 
@@ -310,6 +312,7 @@
         memory_mb: String(config.memory_mb ?? 4096),
         java_path: config.java_path || "",
         curseforge_api_key: config.curseforge_api_key || "",
+        language: i18n.lang,
       },
     };
   }
@@ -318,15 +321,15 @@
     const f = dialog.form;
     const name = f.name.trim().slice(0, 40);
     const version = f.game_version.trim() || "latest";
-    if (!name) return (dialog.error = "Podaj nazwę profilu.");
-    if (!validVersion(version)) return (dialog.error = "Wersja gry musi mieć postać np. 1.21.1 albo „latest”.");
+    if (!name) return (dialog.error = t("Enter a profile name.", "Podaj nazwę profilu."));
+    if (!validVersion(version)) return (dialog.error = t("The game version must look like 1.21.1 or “latest”.", "Wersja gry musi mieć postać np. 1.21.1 albo „latest”."));
     const pid = newId(name);
     data.profiles[pid] = { name, game_version: version, loader: f.loader };
     if (f.loader !== "vanilla" && f.loader_version) data.profiles[pid].loader_version = f.loader_version;
     data.selected = pid;
     dialog = null;
     saveProfiles();
-    setStatus(`Utworzono profil „${name}”`);
+    setStatus(t(`Created profile “${name}”`, `Utworzono profil „${name}”`));
   }
 
   function submitEdit() {
@@ -334,17 +337,17 @@
     const pid = dialog.pid;
     const name = f.name.trim().slice(0, 40);
     const version = f.game_version.trim() || "latest";
-    if (busyPid === pid || runningPid === pid) return (dialog.error = "Zamknij grę przed zmianą profilu.");
-    if (!name) return (dialog.error = "Nazwa profilu nie może być pusta.");
-    if (!validVersion(version)) return (dialog.error = "Wersja gry musi mieć postać np. 1.21.1 albo „latest”.");
+    if (busyPid === pid || runningPid === pid) return (dialog.error = t("Close the game before changing the profile.", "Zamknij grę przed zmianą profilu."));
+    if (!name) return (dialog.error = t("The profile name cannot be empty.", "Nazwa profilu nie może być pusta."));
+    if (!validVersion(version)) return (dialog.error = t("The game version must look like 1.21.1 or “latest”.", "Wersja gry musi mieć postać np. 1.21.1 albo „latest”."));
     const pin = f.loader_version.trim();
     if (pin && !/^[0-9A-Za-z.+_-]{1,60}$/.test(pin))
-      return (dialog.error = "Wersja loadera może zawierać tylko litery, cyfry i znaki . + _ -");
+      return (dialog.error = t("The loader version may only contain letters, digits and . + _ -", "Wersja loadera może zawierać tylko litery, cyfry i znaki . + _ -"));
     let ram = null;
     if (f.memory_mb.trim()) {
       ram = Number(f.memory_mb.trim());
       if (!Number.isInteger(ram) || ram < 1024 || ram > 65536)
-        return (dialog.error = "Pamięć RAM musi być liczbą 1024–65536 albo pusta.");
+        return (dialog.error = t("RAM must be a number from 1024 to 65536, or empty.", "Pamięć RAM musi być liczbą 1024–65536 albo pusta."));
     }
     const p = { ...$state.snapshot(data.profiles[pid]), name, game_version: version, loader: f.loader };
     if (pin && f.loader !== "vanilla") p.loader_version = pin;
@@ -357,20 +360,26 @@
     dialog = null;
     saveProfiles();
     refreshModCount();
-    setStatus(`Zapisano profil „${name}”`);
+    setStatus(t(`Saved profile “${name}”`, `Zapisano profil „${name}”`));
   }
 
   async function submitSettings() {
     const f = dialog.form;
     const ram = Number(f.memory_mb.trim());
     if (!Number.isInteger(ram) || ram < 1024 || ram > 65536)
-      return (dialog.error = "Pamięć RAM musi być liczbą 1024–65536.");
-    const update = { memory_mb: ram, java_path: f.java_path.trim(), curseforge_api_key: f.curseforge_api_key.trim() };
+      return (dialog.error = t("RAM must be a number from 1024 to 65536.", "Pamięć RAM musi być liczbą 1024–65536."));
+    const update = {
+      memory_mb: ram,
+      java_path: f.java_path.trim(),
+      curseforge_api_key: f.curseforge_api_key.trim(),
+      language: f.language,
+    };
     try {
       await invoke("save_config", { update });
       config = { ...config, ...update };
+      i18n.lang = update.language;
       dialog = null;
-      setStatus("Zapisano ustawienia");
+      setStatus(t("Settings saved", "Zapisano ustawienia"));
     } catch (e) {
       dialog.error = String(e);
     }
@@ -378,17 +387,17 @@
 
   async function copyProfile() {
     const pid = data.selected;
-    if (busyPid === pid || runningPid === pid) return setStatus("Zamknij grę przed kopiowaniem profilu.", true);
+    if (busyPid === pid || runningPid === pid) return setStatus(t("Close the game before copying the profile.", "Zamknij grę przed kopiowaniem profilu."), true);
     const p = $state.snapshot(data.profiles[pid]);
-    const name = `${p.name} (kopia)`.slice(0, 40);
+    const name = `${p.name} (${t("copy", "kopia")})`.slice(0, 40);
     const dst = newId(name);
-    setStatus(`Kopiuję profil „${p.name}”…`);
+    setStatus(t(`Copying profile “${p.name}”…`, `Kopiuję profil „${p.name}”…`));
     try {
       await invoke("copy_profile", { src: pid, dst });
       data.profiles[dst] = { ...p, name };
       data.selected = dst;
       await saveProfiles();
-      setStatus(`Skopiowano profil jako „${name}”`);
+      setStatus(t(`Copied the profile as “${name}”`, `Skopiowano profil jako „${name}”`));
     } catch (e) {
       setStatus(String(e), true);
     }
@@ -396,14 +405,17 @@
 
   function deleteProfile() {
     const pid = data.selected;
-    if (pid === "default") return setStatus("Profilu domyślnego nie można usunąć.", true);
-    if (busyPid === pid || runningPid === pid) return setStatus("Zamknij grę przed usunięciem profilu.", true);
+    if (pid === "default") return setStatus(t("The default profile cannot be removed.", "Profilu domyślnego nie można usunąć."), true);
+    if (busyPid === pid || runningPid === pid) return setStatus(t("Close the game before removing the profile.", "Zamknij grę przed usunięciem profilu."), true);
     const name = data.profiles[pid].name;
-    if (!confirm(`Usunąć profil „${name}” z listy?\n\nPliki (światy, mody) zostaną na dysku.`)) return;
+    if (!confirm(t(
+      `Remove profile “${name}” from the list?\n\nIts files (worlds, mods) stay on disk.`,
+      `Usunąć profil „${name}” z listy?\n\nPliki (światy, mody) zostaną na dysku.`,
+    ))) return;
     delete data.profiles[pid];
     data.selected = data.profiles.default ? "default" : Object.keys(data.profiles)[0];
     saveProfiles();
-    setStatus(`Usunięto profil „${name}” z listy. Jego pliki zostały na dysku.`);
+    setStatus(t(`Removed profile “${name}” from the list. Its files stayed on disk.`, `Usunięto profil „${name}” z listy. Jego pliki zostały na dysku.`));
   }
 
   async function openFolder(pid, sub = null) {
@@ -441,22 +453,23 @@
         runningPid = e.payload;
         busyPid = null;
         progress = 1;
-        setStatus(`Gra uruchomiona (${data.profiles[e.payload]?.name ?? e.payload})`);
+        setStatus(t(`Game started (${data.profiles[e.payload]?.name ?? e.payload})`, `Gra uruchomiona (${data.profiles[e.payload]?.name ?? e.payload})`));
       }),
       listen("game-exit", (e) => {
         runningPid = null;
         busyPid = null;
         progress = 0;
-        setStatus(`Gra zakończona (kod ${e.payload ?? "?"})`, e.payload !== 0 && e.payload !== null);
+        setStatus(t(`Game closed (code ${e.payload ?? "?"})`, `Gra zakończona (kod ${e.payload ?? "?"})`), e.payload !== 0 && e.payload !== null);
       }),
     ];
     (async () => {
       try {
         info = await invoke("app_info");
-        data = await invoke("get_profiles");
         config = await invoke("get_config");
-        addLog(`Folder launchera: ${info.data_dir}`);
-        setStatus("Gotowe");
+        i18n.lang = config.language === "pl" ? "pl" : "en";
+        data = await invoke("get_profiles");
+        addLog(`${t("Launcher folder", "Folder launchera")}: ${info.data_dir}`);
+        setStatus(t("Ready", "Gotowe"));
         refreshModCount();
         if (await invoke("has_saved_login")) login(); // ciche odświeżenie zapisanej sesji
         versions = ["latest", ...(await invoke("list_versions"))];
@@ -483,32 +496,32 @@
   </header>
 
   <nav class="toolbar">
-    <button onclick={openAdd}>＋ Dodaj profil</button>
-    <button onclick={() => openDownloader("modpack")}>Modpacki…</button>
+    <button onclick={openAdd}>＋ {t("Add profile", "Dodaj profil")}</button>
+    <button onclick={() => openDownloader("modpack")}>{t("Modpacks…", "Modpacki…")}</button>
     <div class="menu-wrap">
-      <button onclick={(e) => { e.stopPropagation(); menu = menu === "folders" ? null : "folders"; }}>Foldery ▾</button>
+      <button onclick={(e) => { e.stopPropagation(); menu = menu === "folders" ? null : "folders"; }}>{t("Folders", "Foldery")} ▾</button>
       {#if menu === "folders"}
         <div class="menu left">
-          <button class="menu-item" onclick={() => openFolder("")}>Folder launchera</button>
-          <button class="menu-item" onclick={() => openFolder(data.selected)}>Folder profilu</button>
-          <button class="menu-item" onclick={() => openFolder(data.selected, "mods")}>Folder mods</button>
+          <button class="menu-item" onclick={() => openFolder("")}>{t("Launcher folder", "Folder launchera")}</button>
+          <button class="menu-item" onclick={() => openFolder(data.selected)}>{t("Profile folder", "Folder profilu")}</button>
+          <button class="menu-item" onclick={() => openFolder(data.selected, "mods")}>{t("Mods folder", "Folder mods")}</button>
         </div>
       {/if}
     </div>
-    <button onclick={openSettings}>Ustawienia</button>
-    <button class:active={consoleOpen} onclick={() => (consoleOpen = !consoleOpen)}>Konsola</button>
+    <button onclick={openSettings}>{t("Settings", "Ustawienia")}</button>
+    <button class:active={consoleOpen} onclick={() => (consoleOpen = !consoleOpen)}>{t("Console", "Konsola")}</button>
     <div class="spacer"></div>
     <div class="menu-wrap">
       <button
         onclick={(e) => { e.stopPropagation(); account ? (menu = menu === "account" ? null : "account") : login(); }}
         disabled={loggingIn && !loginCode}
       >
-        {#if loggingIn}Logowanie…{:else if account}● {account.name} ▾{:else}Zaloguj się{/if}
+        {#if loggingIn}{t("Signing in…", "Logowanie…")}{:else if account}● {account.name} ▾{:else}{t("Sign in", "Zaloguj się")}{/if}
       </button>
       {#if menu === "account" && account}
         <div class="menu">
-          <div class="menu-item muted">Zalogowano: {account.name}</div>
-          <button class="menu-item" onclick={logout}>Wyloguj</button>
+          <div class="menu-item muted">{t("Signed in", "Zalogowano")}: {account.name}</div>
+          <button class="menu-item" onclick={logout}>{t("Sign out", "Wyloguj")}</button>
         </div>
       {/if}
     </div>
@@ -527,7 +540,7 @@
           <div class="icon" style:background={color(pid)}>{(p.name[0] || "?").toUpperCase()}</div>
           <div class="name">{p.name}</div>
           <div class="sub" class:live={pid === busyPid || pid === runningPid}>
-            {#if pid === runningPid}▶ w grze{:else if pid === busyPid}uruchamianie…{:else}{versionLabel(p)}{/if}
+            {#if pid === runningPid}▶ {t("playing", "w grze")}{:else if pid === busyPid}{t("starting…", "uruchamianie…")}{:else}{versionLabel(p)}{/if}
           </div>
         </button>
       {/each}
@@ -538,21 +551,21 @@
         <div class="big-icon" style:background={color(data.selected)}>{(selected.name[0] || "?").toUpperCase()}</div>
         <div class="side-name">{selected.name}</div>
         <div class="muted">Minecraft {versionLabel(selected)}</div>
-        <div class="muted">{selected.loader === "vanilla" ? "bez modów" : pluralMods(modCount)}</div>
+        <div class="muted">{selected.loader === "vanilla" ? t("no mods", "bez modów") : pluralMods(modCount)}</div>
         <button class="primary wide" onclick={() => play()} disabled={busy}>
-          {#if busyPid}Uruchamianie…{:else if runningPid}▶ W grze{:else}▶ Graj{/if}
+          {#if busyPid}{t("Starting…", "Uruchamianie…")}{:else if runningPid}▶ {t("Playing", "W grze")}{:else}▶ {t("Play", "Graj")}{/if}
         </button>
-        <button class="danger full" onclick={stop} disabled={runningPid !== data.selected}>■ Zatrzymaj</button>
+        <button class="danger full" onclick={stop} disabled={runningPid !== data.selected}>■ {t("Stop", "Zatrzymaj")}</button>
         <div class="gap"></div>
-        <button class="full" onclick={() => openEdit()}>Edytuj profil…</button>
-        <button class="full" onclick={() => openDownloader()}>Pobierz mody i paczki…</button>
-        <button class="full" onclick={() => openFolder(data.selected)}>Folder profilu</button>
-        <button class="full" onclick={copyProfile}>Kopiuj profil</button>
+        <button class="full" onclick={() => openEdit()}>{t("Edit profile…", "Edytuj profil…")}</button>
+        <button class="full" onclick={() => openDownloader()}>{t("Get mods and packs…", "Pobierz mody i paczki…")}</button>
+        <button class="full" onclick={() => openFolder(data.selected)}>{t("Profile folder", "Folder profilu")}</button>
+        <button class="full" onclick={copyProfile}>{t("Copy profile", "Kopiuj profil")}</button>
         <button
           class="danger full"
           onclick={deleteProfile}
           disabled={data.selected === "default" || busyPid === data.selected || runningPid === data.selected}
-        >Usuń profil</button>
+        >{t("Remove profile", "Usuń profil")}</button>
       </aside>
     {/if}
   </main>
@@ -560,8 +573,8 @@
   {#if consoleOpen}
     <section class="console">
       <div class="console-bar">
-        <button onclick={() => navigator.clipboard?.writeText(log.join("\n"))}>Kopiuj wszystko</button>
-        <button onclick={() => (log = [])}>Wyczyść</button>
+        <button onclick={() => navigator.clipboard?.writeText(log.join("\n"))}>{t("Copy all", "Kopiuj wszystko")}</button>
+        <button onclick={() => (log = [])}>{t("Clear", "Wyczyść")}</button>
       </div>
       <pre>{log.slice(-600).join("\n")}</pre>
     </section>
@@ -576,14 +589,14 @@
 {#if loginCode}
   <div class="overlay">
     <div class="dialog center">
-      <h2>Zaloguj się kontem Microsoft</h2>
-      <p class="muted">Wejdź na {loginCode.uri} i wpisz kod:</p>
+      <h2>{t("Sign in with Microsoft", "Zaloguj się kontem Microsoft")}</h2>
+      <p class="muted">{t("Go to", "Wejdź na")} {loginCode.uri} {t("and enter the code:", "i wpisz kod:")}</p>
       <div class="code">{loginCode.code}</div>
-      <p class="muted small">Kod jest już w schowku. Okno zamknie się samo po zalogowaniu.</p>
+      <p class="muted small">{t("The code is already on your clipboard. This window closes by itself after you sign in.", "Kod jest już w schowku. Okno zamknie się samo po zalogowaniu.")}</p>
       <div class="row">
-        <button class="primary" onclick={() => invoke("open_url", { url: loginCode.uri })}>Otwórz stronę</button>
-        <button onclick={copyCode}>Kopiuj kod</button>
-        <button onclick={cancelLogin}>Anuluj</button>
+        <button class="primary" onclick={() => invoke("open_url", { url: loginCode.uri })}>{t("Open page", "Otwórz stronę")}</button>
+        <button onclick={copyCode}>{t("Copy code", "Kopiuj kod")}</button>
+        <button onclick={cancelLogin}>{t("Cancel", "Anuluj")}</button>
       </div>
     </div>
   </div>
@@ -604,127 +617,133 @@
   <div class="overlay">
     <div class="dialog">
       {#if dialog.kind === "add"}
-        <h2>Nowy profil</h2>
-        <label>Nazwa <input bind:value={dialog.form.name} maxlength="40" /></label>
-        <label>Wersja gry <input bind:value={dialog.form.game_version} list="versions" /></label>
-        <label>Loader modów
+        <h2>{t("New profile", "Nowy profil")}</h2>
+        <label>{t("Name", "Nazwa")} <input bind:value={dialog.form.name} maxlength="40" /></label>
+        <label>{t("Game version", "Wersja gry")} <input bind:value={dialog.form.game_version} list="versions" /></label>
+        <label>{t("Mod loader", "Loader modów")}
           <select bind:value={dialog.form.loader} onchange={() => (dialog.form.loader_version = "")}>
-            {#each LOADERS as [id, label]}<option value={id}>{label}</option>{/each}
+            {#each LOADER_IDS as id}<option value={id}>{loaderLabel(id)}</option>{/each}
           </select>
         </label>
-        <label>Wersja loadera
+        <label>{t("Loader version", "Wersja loadera")}
           <select bind:value={dialog.form.loader_version} disabled={dialog.form.loader === "vanilla"}>
-            <option value="">{dialog.form.loader === "vanilla" ? "—" : "Najnowsza (zalecana)"}</option>
+            <option value="">{dialog.form.loader === "vanilla" ? "—" : t("Latest (recommended)", "Najnowsza (zalecana)")}</option>
             {#if dialog.form.loader_version && !loaderVersions.list.some((l) => l.version === dialog.form.loader_version)}
               <option value={dialog.form.loader_version}>{dialog.form.loader_version}</option>
             {/if}
             {#each loaderVersions.list as l}
-              <option value={l.version}>{l.version}{l.stable ? "" : " (testowa)"}</option>
+              <option value={l.version}>{l.version}{l.stable ? "" : t(" (beta)", " (testowa)")}</option>
             {/each}
           </select>
         </label>
         {#if dialog.form.loader !== "vanilla"}
           <p class="muted small">
-            {#if loaderVersions.loading}Wczytuję listę wersji…
+            {#if loaderVersions.loading}{t("Loading versions…", "Wczytuję listę wersji…")}
             {:else if loaderVersions.error}{loaderVersions.error}
-            {:else if !loaderVersions.list.length}Brak wersji tego loadera dla tej wersji gry.
-            {:else}Dostępnych wersji: {loaderVersions.list.length}{/if}
+            {:else if !loaderVersions.list.length}{t("This loader has no versions for this game version.", "Brak wersji tego loadera dla tej wersji gry.")}
+            {:else}{t("Available versions", "Dostępnych wersji")}: {loaderVersions.list.length}{/if}
           </p>
         {/if}
       {:else if dialog.kind === "edit"}
-        <h2>Profil – {data.profiles[dialog.pid]?.name}</h2>
+        <h2>{t("Profile", "Profil")} – {data.profiles[dialog.pid]?.name}</h2>
         <div class="tabs">
-          {#each [["version", "Wersja"], ["mods", "Mody"], ["packs", "Paczki zasobów"], ["settings", "Ustawienia"]] as [t, label]}
-            <button class:on={dialog.tab === t} onclick={() => { dialog.tab = t; editMsg = { text: "", error: false }; refreshEditLists(); }}>{label}</button>
+          {#each [["version", t("Version", "Wersja")], ["mods", t("Mods", "Mody")], ["packs", t("Resource packs", "Paczki zasobów")], ["settings", t("Settings", "Ustawienia")]] as [tab, label]}
+            <button class:on={dialog.tab === tab} onclick={() => { dialog.tab = tab; editMsg = { text: "", error: false }; refreshEditLists(); }}>{label}</button>
           {/each}
         </div>
         {#if dialog.tab === "version"}
-          <label>Nazwa <input bind:value={dialog.form.name} maxlength="40" /></label>
-          <label>Wersja gry („latest” = najnowsza) <input bind:value={dialog.form.game_version} list="versions" /></label>
-          <label>Loader modów
+          <label>{t("Name", "Nazwa")} <input bind:value={dialog.form.name} maxlength="40" /></label>
+          <label>{t("Game version (“latest” = newest)", "Wersja gry („latest” = najnowsza)")} <input bind:value={dialog.form.game_version} list="versions" /></label>
+          <label>{t("Mod loader", "Loader modów")}
             <select bind:value={dialog.form.loader} onchange={() => (dialog.form.loader_version = "")}>
-              {#each LOADERS as [id, label]}<option value={id}>{label}</option>{/each}
+              {#each LOADER_IDS as id}<option value={id}>{loaderLabel(id)}</option>{/each}
             </select>
           </label>
-        <label>Wersja loadera
+        <label>{t("Loader version", "Wersja loadera")}
             <select bind:value={dialog.form.loader_version} disabled={dialog.form.loader === "vanilla"}>
-              <option value="">{dialog.form.loader === "vanilla" ? "—" : "Najnowsza (zalecana)"}</option>
+              <option value="">{dialog.form.loader === "vanilla" ? "—" : t("Latest (recommended)", "Najnowsza (zalecana)")}</option>
               {#if dialog.form.loader_version && !loaderVersions.list.some((l) => l.version === dialog.form.loader_version)}
                 <option value={dialog.form.loader_version}>{dialog.form.loader_version}</option>
               {/if}
               {#each loaderVersions.list as l}
-                <option value={l.version}>{l.version}{l.stable ? "" : " (testowa)"}</option>
+                <option value={l.version}>{l.version}{l.stable ? "" : t(" (beta)", " (testowa)")}</option>
               {/each}
             </select>
           </label>
           {#if dialog.form.loader !== "vanilla"}
             <p class="muted small">
-              {#if loaderVersions.loading}Wczytuję listę wersji…
+              {#if loaderVersions.loading}{t("Loading versions…", "Wczytuję listę wersji…")}
               {:else if loaderVersions.error}{loaderVersions.error}
-              {:else if !loaderVersions.list.length}Brak wersji tego loadera dla tej wersji gry.
-              {:else}Dostępnych wersji: {loaderVersions.list.length}{/if}
+              {:else if !loaderVersions.list.length}{t("This loader has no versions for this game version.", "Brak wersji tego loadera dla tej wersji gry.")}
+              {:else}{t("Available versions", "Dostępnych wersji")}: {loaderVersions.list.length}{/if}
             </p>
           {/if}
           {#if dialog.form.loader === "forge" || dialog.form.loader === "neoforge"}
-            <p class="muted small">Forge i NeoForge instalują się przy pierwszym uruchomieniu (kilka minut).</p>
+            <p class="muted small">{t("Forge and NeoForge install on the first launch (a few minutes).", "Forge i NeoForge instalują się przy pierwszym uruchomieniu (kilka minut).")}</p>
           {/if}
         {:else if dialog.tab === "settings"}
-          <label>Pamięć RAM w MB (puste = {config.memory_mb} z ustawień)
+          <label>{t(`RAM in MB (empty = ${config.memory_mb} from Settings)`, `Pamięć RAM w MB (puste = ${config.memory_mb} z ustawień)`)}
             <input bind:value={dialog.form.memory_mb} inputmode="numeric" />
           </label>
-          <label>Dodatkowe argumenty JVM <input bind:value={dialog.form.jvm_args} /></label>
+          <label>{t("Extra JVM arguments", "Dodatkowe argumenty JVM")} <input bind:value={dialog.form.jvm_args} /></label>
         {:else if dialog.tab === "mods"}
           <div class="list-bar">
-            <button class="primary" onclick={() => openDownloader("mod", dialog.pid)}>Pobierz mody…</button>
-            <button onclick={() => openFolder(dialog.pid, "mods")}>Folder mods</button>
+            <button class="primary" onclick={() => openDownloader("mod", dialog.pid)}>{t("Get mods…", "Pobierz mody…")}</button>
+            <button onclick={() => openFolder(dialog.pid, "mods")}>{t("Mods folder", "Folder mods")}</button>
           </div>
           {#if data.profiles[dialog.pid]?.loader === "vanilla"}
-            <p class="error">Ten profil nie ma loadera modów, więc mody nie zostaną wczytane.</p>
+            <p class="error">{t("This profile has no mod loader, so mods will not load.", "Ten profil nie ma loadera modów, więc mody nie zostaną wczytane.")}</p>
           {/if}
           <div class="list">
             {#each editMods as m (m.file)}
               <div class="item">
-                <input type="checkbox" checked={m.enabled} onchange={() => toggleMod(m)} title="Włącz / wyłącz" />
+                <input type="checkbox" checked={m.enabled} onchange={() => toggleMod(m)} title={t("Enable / disable", "Włącz / wyłącz")} />
                 <span class="item-title" class:off={!m.enabled}>{m.title}</span>
-                <span class="muted">{m.source}</span>
-                <button class="danger small-btn" onclick={() => removeMod(m)}>Usuń</button>
+                <span class="muted">{m.source === "manual" ? t("manual", "ręcznie") : m.source}</span>
+                <button class="danger small-btn" onclick={() => removeMod(m)}>{t("Remove", "Usuń")}</button>
               </div>
             {:else}
-              <p class="muted">Brak modów.</p>
+              <p class="muted">{t("No mods.", "Brak modów.")}</p>
             {/each}
           </div>
         {:else}
           <div class="list-bar">
-            <button class="primary" onclick={() => openDownloader("resourcepack", dialog.pid)}>Pobierz paczki zasobów…</button>
-            <button onclick={() => openFolder(dialog.pid, "resourcepacks")}>Folder</button>
+            <button class="primary" onclick={() => openDownloader("resourcepack", dialog.pid)}>{t("Get resource packs…", "Pobierz paczki zasobów…")}</button>
+            <button onclick={() => openFolder(dialog.pid, "resourcepacks")}>{t("Folder", "Folder")}</button>
           </div>
           <div class="list">
             {#each editPacks as m (m.file)}
               <div class="item">
                 <span class="item-title">{m.title}</span>
-                <span class="muted">{m.source}</span>
-                <button class="danger small-btn" onclick={() => removePack(m)}>Usuń</button>
+                <span class="muted">{m.source === "manual" ? t("manual", "ręcznie") : m.source}</span>
+                <button class="danger small-btn" onclick={() => removePack(m)}>{t("Remove", "Usuń")}</button>
               </div>
             {:else}
-              <p class="muted">Brak paczek zasobów. Włączysz je w grze: Opcje → Paczki zasobów.</p>
+              <p class="muted">{t("No resource packs. Enable them in game: Options → Resource Packs.", "Brak paczek zasobów. Włączysz je w grze: Opcje → Paczki zasobów.")}</p>
             {/each}
           </div>
         {/if}
         {#if editMsg.text}<p class="small" class:error={editMsg.error} class:okmsg={!editMsg.error}>{editMsg.text}</p>{/if}
       {:else}
-        <h2>Ustawienia launchera</h2>
-        <label>Pamięć RAM dla gry (MB) <input bind:value={dialog.form.memory_mb} inputmode="numeric" /></label>
-        <label>Ścieżka do Javy (puste = pobierz od Mojangu) <input bind:value={dialog.form.java_path} /></label>
-        <label>Własny klucz API CurseForge <input type="password" bind:value={dialog.form.curseforge_api_key} /></label>
+        <h2>{t("Launcher settings", "Ustawienia launchera")}</h2>
+        <label>{t("Language", "Język")}
+          <select bind:value={dialog.form.language}>
+            <option value="en">English</option>
+            <option value="pl">Polski</option>
+          </select>
+        </label>
+        <label>{t("Game RAM (MB)", "Pamięć RAM dla gry (MB)")} <input bind:value={dialog.form.memory_mb} inputmode="numeric" /></label>
+        <label>{t("Java path (empty = download from Mojang)", "Ścieżka do Javy (puste = pobierz od Mojangu)")} <input bind:value={dialog.form.java_path} /></label>
+        <label>{t("Your own CurseForge API key", "Własny klucz API CurseForge")} <input type="password" bind:value={dialog.form.curseforge_api_key} /></label>
       {/if}
       {#if dialog.error}<p class="error">{dialog.error}</p>{/if}
       <div class="row end">
         {#if dialog.kind === "edit" && (dialog.tab === "mods" || dialog.tab === "packs")}
-          <button onclick={() => (dialog = null)}>Zamknij</button>
+          <button onclick={() => (dialog = null)}>{t("Close", "Zamknij")}</button>
         {:else}
-          <button onclick={() => (dialog = null)}>Anuluj</button>
+          <button onclick={() => (dialog = null)}>{t("Cancel", "Anuluj")}</button>
           <button class="primary" onclick={() => ({ add: submitAdd, edit: submitEdit, settings: submitSettings })[dialog.kind]()}>
-            {dialog.kind === "add" ? "Utwórz" : "Zapisz"}
+            {dialog.kind === "add" ? t("Create", "Utwórz") : t("Save", "Zapisz")}
           </button>
         {/if}
       </div>

@@ -87,7 +87,7 @@ fn save_refresh_token(token: &str) {
 }
 
 fn net_error(e: reqwest::Error) -> String {
-    format!("Błąd połączenia: {e}")
+    tr!("Connection error: {e}", "Błąd połączenia: {e}")
 }
 
 /// POST, ktory zwraca (status, json) takze dla bledow HTTP.
@@ -113,8 +113,8 @@ fn describe(v: &Value) -> String {
     v["error_description"]
         .as_str()
         .or_else(|| v["error"].as_str())
-        .unwrap_or("nieznany błąd")
-        .to_string()
+        .map(str::to_string)
+        .unwrap_or_else(|| tr!("unknown error", "nieznany błąd"))
 }
 
 /// Czeka `secs` sekund, sprawdzajac co chwile, czy logowanie anulowano.
@@ -122,7 +122,7 @@ async fn wait(secs: u64, cancel: &AtomicBool) -> Result<(), String> {
     let end = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < end {
         if cancel.load(Ordering::Relaxed) {
-            return Err("Logowanie anulowane".into());
+            return Err(tr!("Sign-in cancelled", "Logowanie anulowane"));
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -144,9 +144,9 @@ async fn msa_token(app: &AppHandle, client: &reqwest::Client, cid: &str, cancel:
     let (status, dev) =
         post_form(client, &format!("{MSA}/devicecode"), &[("client_id", cid), ("scope", SCOPE)]).await?;
     if status != 200 {
-        return Err(format!("Microsoft odrzucił aplikację: {}", describe(&dev)));
+        return Err(tr!("Microsoft rejected the app: {}", "Microsoft odrzucił aplikację: {}", describe(&dev)));
     }
-    let device_code = dev["device_code"].as_str().ok_or("Brak kodu urządzenia w odpowiedzi")?.to_string();
+    let device_code = dev["device_code"].as_str().ok_or_else(|| tr!("No device code in the response", "Brak kodu urządzenia w odpowiedzi"))?.to_string();
     let code = dev["user_code"].as_str().unwrap_or_default().to_string();
     let uri = dev["verification_uri"].as_str().unwrap_or("https://www.microsoft.com/link").to_string();
     let _ = app.emit("login-code", CodeEvent { code, uri: uri.clone() });
@@ -173,10 +173,10 @@ async fn msa_token(app: &AppHandle, client: &reqwest::Client, cid: &str, cancel:
         match tok["error"].as_str() {
             Some("authorization_pending") => {}
             Some("slow_down") => interval += 5,
-            _ => return Err(format!("Logowanie przerwane: {}", describe(&tok))),
+            _ => return Err(tr!("Sign-in failed: {}", "Logowanie przerwane: {}", describe(&tok))),
         }
     }
-    Err("Kod logowania wygasł, spróbuj ponownie".into())
+    Err(tr!("The sign-in code expired, try again", "Kod logowania wygasł, spróbuj ponownie"))
 }
 
 pub async fn login(app: &AppHandle, cancel: &AtomicBool) -> Result<Account, String> {
@@ -190,7 +190,7 @@ pub async fn login(app: &AppHandle, cancel: &AtomicBool) -> Result<Account, Stri
     if let Some(refresh) = tok["refresh_token"].as_str() {
         save_refresh_token(refresh);
     }
-    let access = tok["access_token"].as_str().ok_or("Microsoft nie zwrócił tokenu")?;
+    let access = tok["access_token"].as_str().ok_or_else(|| tr!("Microsoft returned no token", "Microsoft nie zwrócił tokenu"))?;
 
     let (status, xbl) = post_json(
         &client,
@@ -202,10 +202,10 @@ pub async fn login(app: &AppHandle, cancel: &AtomicBool) -> Result<Account, Stri
     )
     .await?;
     if status != 200 {
-        return Err(format!("Xbox Live odrzucił logowanie ({status})"));
+        return Err(tr!("Xbox Live rejected the sign-in ({status})", "Xbox Live odrzucił logowanie ({status})"));
     }
-    let uhs = xbl["DisplayClaims"]["xui"][0]["uhs"].as_str().ok_or("Brak danych Xbox Live")?.to_string();
-    let xbl_token = xbl["Token"].as_str().ok_or("Brak tokenu Xbox Live")?.to_string();
+    let uhs = xbl["DisplayClaims"]["xui"][0]["uhs"].as_str().ok_or_else(|| tr!("No Xbox Live data", "Brak danych Xbox Live"))?.to_string();
+    let xbl_token = xbl["Token"].as_str().ok_or_else(|| tr!("No Xbox Live token", "Brak tokenu Xbox Live"))?.to_string();
 
     let (status, xsts) = post_json(
         &client,
@@ -218,15 +218,15 @@ pub async fn login(app: &AppHandle, cancel: &AtomicBool) -> Result<Account, Stri
     .await?;
     if status != 200 {
         let reason = match xsts["XErr"].as_u64() {
-            Some(2148916233) => "to konto Microsoft nie ma profilu Xbox".to_string(),
-            Some(2148916235) => "Xbox Live jest niedostępny w tym kraju".to_string(),
-            Some(2148916238) => "konto dziecka: musi być dodane do rodziny Microsoft".to_string(),
-            Some(code) => format!("błąd {code}"),
-            None => format!("błąd {status}"),
+            Some(2148916233) => tr!("this Microsoft account has no Xbox profile", "to konto Microsoft nie ma profilu Xbox"),
+            Some(2148916235) => tr!("Xbox Live is not available in this country", "Xbox Live jest niedostępny w tym kraju"),
+            Some(2148916238) => tr!("child account: it must be added to a Microsoft family", "konto dziecka: musi być dodane do rodziny Microsoft"),
+            Some(code) => tr!("error {code}", "błąd {code}"),
+            None => tr!("error {status}", "błąd {status}"),
         };
         return Err(format!("XSTS: {reason}"));
     }
-    let xsts_token = xsts["Token"].as_str().ok_or("Brak tokenu XSTS")?;
+    let xsts_token = xsts["Token"].as_str().ok_or_else(|| tr!("No XSTS token", "Brak tokenu XSTS"))?;
 
     let (status, mc) = post_json(
         &client,
@@ -235,10 +235,10 @@ pub async fn login(app: &AppHandle, cancel: &AtomicBool) -> Result<Account, Stri
     )
     .await?;
     if status != 200 {
-        let hint = if status == 403 { " Aplikacja nie ma jeszcze zgody Mojangu na API Minecrafta." } else { "" };
-        return Err(format!("Minecraft Services odrzucił logowanie ({status}).{hint}"));
+        let hint = if status == 403 { tr!(" The app is not yet approved by Mojang for the Minecraft API.", " Aplikacja nie ma jeszcze zgody Mojangu na API Minecrafta.") } else { String::new() };
+        return Err(tr!("Minecraft Services rejected the sign-in ({status}).{hint}", "Minecraft Services odrzucił logowanie ({status}).{hint}"));
     }
-    let mc_token = mc["access_token"].as_str().ok_or("Brak tokenu Minecrafta")?.to_string();
+    let mc_token = mc["access_token"].as_str().ok_or_else(|| tr!("No Minecraft token", "Brak tokenu Minecrafta"))?.to_string();
 
     let resp = client
         .get("https://api.minecraftservices.com/minecraft/profile")
@@ -247,7 +247,7 @@ pub async fn login(app: &AppHandle, cancel: &AtomicBool) -> Result<Account, Stri
         .await
         .map_err(net_error)?;
     if resp.status().as_u16() == 404 {
-        return Err("To konto nie ma kupionego Minecraft: Java Edition".into());
+        return Err(tr!("This account does not own Minecraft: Java Edition", "To konto nie ma kupionego Minecraft: Java Edition"));
     }
     let profile: Value = resp.error_for_status().map_err(|e| e.to_string())?.json().await.map_err(net_error)?;
     Ok(Account {

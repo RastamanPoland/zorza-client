@@ -1,6 +1,6 @@
 [package]
 name = "zorza"
-version = "0.7.0"
+version = "0.8.0"
 description = "Zorza Client - launcher Minecraft: Java Edition"
 authors = ["RastamanPoland"]
 edition = "2021"

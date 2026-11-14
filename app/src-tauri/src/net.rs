@@ -29,12 +29,12 @@ pub async fn get_json(client: &reqwest::Client, url: &str) -> Result<Value, Stri
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("Błąd połączenia ({url}): {e}"))?
+        .map_err(|e| tr!("Connection error ({url}): {e}", "Błąd połączenia ({url}): {e}"))?
         .error_for_status()
         .map_err(|e| e.to_string())?
         .json::<Value>()
         .await
-        .map_err(|e| format!("Nieprawidłowa odpowiedź z {url}: {e}"))
+        .map_err(|e| tr!("Invalid response from {url}: {e}", "Nieprawidłowa odpowiedź z {url}: {e}"))
 }
 
 #[cfg(test)]
@@ -90,7 +90,7 @@ async fn fetch(client: &reqwest::Client, t: &Task) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?;
     if let Some(want) = &t.sha1 {
         if !want.is_empty() && sha1_hex(&bytes) != want.to_lowercase() {
-            return Err("zła suma kontrolna".into());
+            return Err(tr!("checksum mismatch", "zła suma kontrolna"));
         }
     }
     Ok(bytes.to_vec())
@@ -101,15 +101,15 @@ pub async fn download(client: &reqwest::Client, t: &Task) -> Result<(), String> 
         return Ok(());
     }
     if let Some(dir) = t.dest.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("Nie można utworzyć {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| tr!("Cannot create {}: {e}", "Nie można utworzyć {}: {e}", dir.display()))?;
     }
     let mut last = String::new();
     for attempt in 0..3u64 {
         match fetch(client, t).await {
             Ok(bytes) => {
                 let tmp = part_path(&t.dest);
-                std::fs::write(&tmp, &bytes).map_err(|e| format!("Nie można zapisać {}: {e}", tmp.display()))?;
-                std::fs::rename(&tmp, &t.dest).map_err(|e| format!("Nie można zapisać {}: {e}", t.dest.display()))?;
+                std::fs::write(&tmp, &bytes).map_err(|e| tr!("Cannot save {}: {e}", "Nie można zapisać {}: {e}", tmp.display()))?;
+                std::fs::rename(&tmp, &t.dest).map_err(|e| tr!("Cannot save {}: {e}", "Nie można zapisać {}: {e}", t.dest.display()))?;
                 return Ok(());
             }
             Err(e) => {
@@ -118,7 +118,7 @@ pub async fn download(client: &reqwest::Client, t: &Task) -> Result<(), String> 
             }
         }
     }
-    Err(format!("Nie udało się pobrać {}: {last}", t.url))
+    Err(tr!("Could not download {}: {last}", "Nie udało się pobrać {}: {last}", t.url))
 }
 
 /// Pobiera brakujace pliki rownolegle. progress(gotowe, wszystkie).
