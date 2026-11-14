@@ -34,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 NAME = "Zorza Client"
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 UA = f"RastamanPoland/zorza-client/{VERSION} (github.com/RastamanPoland/zorza-client)"
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -1566,9 +1566,10 @@ def run_gui():
     # ======================================================= okno: baner i pasek
     banner = tk.Canvas(root, height=64, bg=BG, highlightthickness=0, bd=0)
     banner.pack(fill="x")
+    banner_w = max(1400, min(7680, root.winfo_screenwidth() + 200))  # caly ekran, takze 4K i dwa monitory
     try:
-        rows = render_aurora(1400, 64)
-        root.aurora = tk.PhotoImage(width=1400, height=64)  # referencja, zeby obraz nie zniknal
+        rows = render_aurora(banner_w, 64)
+        root.aurora = tk.PhotoImage(width=banner_w, height=64)  # referencja, zeby obraz nie zniknal
         root.aurora.put(" ".join("{" + " ".join(r) + "}" for r in rows))
         banner.create_image(0, 0, image=root.aurora, anchor="nw")
     except tk.TclError:
