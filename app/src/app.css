@@ -1,0 +1,29 @@
+:root {
+  --bg: #0b0d1a;
+  --panel: #11142a;
+  --panel2: #1a1f3d;
+  --line: #262b4d;
+  --text: #e9ecff;
+  --muted: #8088a8;
+  --green: #3ddc97;
+  --green-hi: #6ff0b6;
+  --red: #ff7a90;
+  --select: #2b3f78;
+  color-scheme: dark;
+  font-family: "Segoe UI", "Inter", system-ui, sans-serif;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--bg);
+}
+* { box-sizing: border-box; }
+html, body, #app { margin: 0; height: 100%; }
+body { overflow: hidden; user-select: none; }
+button {
+  font: inherit; color: var(--text); background: var(--panel2); border: 0;
+  border-radius: 6px; padding: 7px 14px; cursor: pointer;
+}
+button:hover { background: var(--select); }
+button:disabled { color: #59607f; cursor: default; background: var(--panel2); }
+button.primary { background: var(--green); color: #06281b; font-weight: 700; }
+button.primary:hover { background: var(--green-hi); }
+button.danger { color: var(--red); }
